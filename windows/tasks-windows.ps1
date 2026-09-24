@@ -1,4 +1,4 @@
-# tasks-windows.ps1 — создание задач Планировщика Windows для мониторинга и db-clean.
+﻿# tasks-windows.ps1 — создание задач Планировщика Windows для мониторинга и db-clean.
 #
 # Задачи:
 #   tradesoft-pricing-alert   каждые 15 минут  — pricing_alert.py (мониторинг проценки)
@@ -49,8 +49,8 @@ foreach ($k in $env_map.Keys) {
 }
 
 # --- задачи -----------------------------------------------------------------
-function New-Task([string]$Name, [string]$Args, $Trigger) {
-    $action = New-ScheduledTaskAction -Execute $venvPy -Argument $Args -WorkingDirectory $MonitoringRepo
+function New-Task([string]$Name, [string]$Arguments, $Trigger) {
+    $action = New-ScheduledTaskAction -Execute $venvPy -Argument $Arguments -WorkingDirectory $MonitoringRepo
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger `

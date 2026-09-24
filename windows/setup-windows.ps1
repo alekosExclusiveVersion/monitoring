@@ -1,4 +1,4 @@
-# setup-windows.ps1 — перенос monitoring + db-clean на Windows-машину корп. сети.
+﻿# setup-windows.ps1 — перенос monitoring + db-clean на Windows-машину корп. сети.
 #
 # Что делает:
 #   1. проверяет python и создаёт venv в %USERPROFILE%\Work\scripts\monitoring\.venv;
