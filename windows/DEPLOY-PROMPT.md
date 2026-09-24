@@ -6,11 +6,9 @@
 подтянет опытный промит), и проверит результатом `check`.
 
 Перед запуском (делается вручную, не через чат):
-1. Скопируй с Mac папки `~/Work/scripts/monitoring` и `~/Work/scripts/db-clean`
-   (это не git-репо/нет remote) в `%USERPROFILE%\Work\scripts\`.
-2. Скопируй `servers.json` и `servers.key` из
+1. Скопируй `servers.json` и `servers.key` из
    `~/Library/Application Support/Parallels SQL Admin/`
-   в `%APPDATA%\Parallels SQL Admin\`.
+   в `%APPDATA%\Parallels SQL Admin\` (репозитории агент склонирует сам).
 
 ```
 Ты — агент на Windows-машине в корп. сети. Разверни два инструмента мониторинга
@@ -29,14 +27,13 @@ Tradesoft: (1) сторож веб-проценки (pricing-alert) и (2) ав�
 
 Шаги:
 
-1. ПРОВЕРЬ НАЛИЧИЕ репозиториев. Для parallels-sql-admins и ts-b24 — если
-   каталог отсутствует, склонируй:
-     git clone git@github.com:alekosExclusiveVersion/parallels-sql-admins.git
+1. ПРОВЕРЬ НАЛИЧИЕ репозиториев. Для каждого каталога из %USERPROFILE%\Work\:
+   если отсутствует — склонируй:
+     git clone https://github.com/alekosExclusiveVersion/parallels-sql-admins.git
      git clone https://github.com/alekosExclusiveVersion/ts-b24.git
+     git clone https://github.com/alekosExclusiveVersion/monitoring.git
+     git clone https://github.com/alekosExclusiveVersion/db-clean.git
    если присутствует — сделай git pull (ветка main).
-   Каталоги monitoring и db-clean должны уже существовать (скопированы
-   вручную с macOS). Если их нет — сообщи пользователю, что их надо скопировать
-   (это не git-репо, клонировать неоткуда), и остановись.
 
 2. ПРОВЕРЬ python: (py -3 --version или python --version) >= 3.11. Если нет —
    остановись и сообщи.

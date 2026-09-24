@@ -43,10 +43,11 @@
 
 ## Порядок установки (на Windows-машине)
 
-0. **Подготовить репозитории** (можно через opencode/git на этой машине):
+0. **Склонировать репозитории** на Windows-машину (см. `DEPLOY-PROMPT.md`, шаг 1):
    ```
    %USERPROFILE%\Work\scripts\monitoring
    %USERPROFILE%\Work\scripts\db-clean
+   %USERPROFILE%\Work\scripts\parallels-sql-admins
    %USERPROFILE%\Work\ts-b24
    ```
    Плюс бинарь/сборка Parallels SQL Admin для Windows (данные в `%APPDATA%`).
