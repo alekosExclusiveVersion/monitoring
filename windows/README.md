@@ -97,8 +97,28 @@
    ```
 
 7. **Переключение**: после стабильной работы на Windows остановить демоны
-   macOS (launchd: `pricing-alert`, `corp-db-clean*`, `corp-notify`; пользоваться
-   командой установки, см. AGENTS.md). Секреты в Keychain оставить — они не мешают.
+   macOS (launchd: `pricing-alert`, `corp-db-clean*`; `corp-notify` оставить —
+   он обслуживает VPN-баннеры). Секреты в Keychain оставить — они не мешают.
+
+## Наследие macOS (факт после миграции)
+
+Состояние macOS-машины после переноса заданий на Windows (24.09.2026):
+
+| Демон | Что было | Что сейчас |
+|---|---|---|
+| `com.tradesoft.pricing-alert` (user) | сторож проценки, каждые 15 мин | **остановлен + disabled** (bootout + `launchctl disable`) |
+| `com.tradesoft.corp-db-clean` (root) | автоочистка aisql, 03:00 | **остановлен + disabled** (bootout + disable) |
+| `com.tradesoft.corp-db-clean-retry` (root) | ретрай очистки, каждые 15 мин | **остановлен + disabled** |
+| `com.tradesoft.corp-notify` (user) | баннеры + дублирование db-clean в B24/Telegram | **оставлен**, только VPN-ветки: из `corp-notify.sh` вырезаны `db-clean.*` (title и блок дублирования) — артефактная правка вне git, осталась в `/usr/local/sbin/` |
+
+Следствия:
+- pricing-alert и db-clean на macOS больше не шлют события → B24/Telegram не
+  дублируются с Windows;
+- до запуска задач на Windows существует временное окно без боевого мониторинга
+  (кроме VPN-баннеров corp-notify);
+- `pricing_alert.py`/`db-clean-aisql.py` остаются в репозитории как
+  кроссплатформенный код — на Windows они нужны, на macOS их демоны отключены;
+- VPN-маршруты/баннеры (`routes-dead.*`, `vpn.*`) по-прежнему на macOS.
 
 ## Ограничения / нюансы
 
