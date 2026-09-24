@@ -1,0 +1,11 @@
+# Windows-зависимости для monitoring + db-clean (headless).
+# PySide6 из главного requirements не нужен — эти скрипты идут без GUI.
+# keyring использует Windows Credential Manager для хранения секретов.
+# psycopg не нужен: тут используются только MySQL (PyMySQL) и MSSQL (pymssql).
+
+cryptography>=42
+pymssql>=2.3
+PyMySQL>=1.1
+python-dotenv>=1.0
+rich>=13
+keyring>=24
