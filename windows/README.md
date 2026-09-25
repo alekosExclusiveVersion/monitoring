@@ -62,13 +62,22 @@
   `logs\prj_archive_cache.json` (TTL `archive_cache_ttl_hours`, по проекту).
   Системный прокси игнорируется. Секреты: `opencode.projects.prj-login-user`,
   `opencode.projects.prj-login`.
-- Состав блока «Затронутые проекты»: `scope=active` (по умолчанию) — только
-  проекты с активной услугой групп 1/14, 53/74/75; в списке только адрес сайта,
-  по одному в строке, без ID и названия. `scope=hosted` (`--scope hosted`)
-  добавляет все неархивные проекты сервера, включая те, у которых активной
-  услуги нет, — для сверки и разбора. Не более `max_projects_per_server` строк,
+- `sm_projects.py` — реестр проектов из System Monitor
+  (`https://sm.office.tradesoft.ru`): `GET /api/project/<id>` без авторизации,
+  отдаёт `id`, `name`, `users` (логины Parts.Resource), `allowedIpList`;
+  кэш `logs\sm_projects_cache.json` (TTL `sm_cache_ttl_minutes`). Эндпоинт
+  `/api/project/<id>/info` не используется — он отдаёт `apiKey`/`serviceKeys`.
+- Состав блока «Затронутые проекты»: `scope=live` (по умолчанию) — неархивные
+  проекты сервера, у которых есть активная услуга групп 1/14, 53/74/75 **или**
+  пользователь в System Monitor. `users` в System Monitor — это реестр логинов,
+  а не текущие сессии, поэтому список не пустеет, когда сервер лежит.
+  `scope=active` — только активные услуги; `scope=hosted` (`--scope hosted`) —
+  все неархивные проекты сервера, включая проекты без активной услуги и без
+  пользователей, — для сверки и разбора. В списке только адрес сайта, по одному
+  в строке, без ID и названия. Не более `max_projects_per_server` строк,
   остальные свернуты. Группы 53/74/75 учитываются по умолчанию
-  (`projects_portal.extended`), отключаются `--no-extended`.
+  (`projects_portal.extended`), отключаются `--no-extended`. Если System Monitor
+  недоступен, блок строится по активным услугам с соответствующей пометкой.
 - Сообщение = текст триггера, автор, время, блок «Затронутые проекты» на каждый
   упомянутый сервер и ссылка на исходное сообщение; при недоступности портала
   уведомление уходит без списка.
@@ -77,6 +86,7 @@
   .venv\Scripts\python.exe tg_support_read.py --follow
   .venv\Scripts\python.exe tg_support_alert.py --dry-run
   .venv\Scripts\python.exe prj_active_projects.py --server p5ru3
+  .venv\Scripts\python.exe sm_projects.py 4123
   ```
 
 ## Порядок установки (на Windows-машине)

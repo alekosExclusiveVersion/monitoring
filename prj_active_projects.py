@@ -467,6 +467,33 @@ def hosted_projects(
     return sorted(result, key=lambda p: p["id"])
 
 
+def live_projects(
+    server: str,
+    portal: dict | None = None,
+    extended: bool | None = None,
+    refresh: bool = False,
+) -> list[dict]:
+    portal = portal or load_config()
+    hosted = hosted_projects(server, portal, extended, refresh)
+    active = {p["id"] for p in active_projects(server, portal, extended, refresh)}
+    sm = None
+    if portal.get("sm_url"):
+        import sm_projects
+        sm = sm_projects.load_sm()
+        sm_projects.STATS.update(ok=0, errors=0)
+    result = []
+    for prj in hosted:
+        has_service = prj["id"] in active
+        has_user = bool(sm) and sm_projects.has_users(prj["id"], sm, refresh=refresh)
+        prj["active_service"] = has_service
+        if has_service or has_user:
+            prj["sm_user"] = has_user
+            result.append(prj)
+    if sm and sm_projects.STATS["ok"] == 0 and sm_projects.STATS["errors"]:
+        portal["_sm_down"] = True
+    return result
+
+
 def projects_for_server(
     server: str,
     portal: dict | None = None,
@@ -476,6 +503,8 @@ def projects_for_server(
 ) -> list[dict]:
     portal = portal or load_config()
     scope = scope or portal.get("scope", "active")
+    if scope == "live":
+        return live_projects(server, portal, extended, refresh)
     if scope == "hosted":
         return hosted_projects(server, portal, extended, refresh)
     return active_projects(server, portal, extended, refresh)
@@ -485,6 +514,8 @@ def project_status(prj: dict, portal: dict) -> str:
     strict = {int(g) for g in portal.get("groups") or []}
     extended_ids = {int(g) for g in portal.get("extended_groups") or []}
     gids = {int(g["id"]) for g in prj.get("groups") or []}
+    if prj.get("sm_user") and not gids & (strict | extended_ids):
+        return "пользователи в Parts.Resource"
     if gids & strict:
         return "поддержка Parts.Resource"
     if gids & extended_ids:
@@ -494,7 +525,7 @@ def project_status(prj: dict, portal: dict) -> str:
 
 def sort_projects(projects: list[dict], portal: dict) -> list[dict]:
     order = {"поддержка Parts.Resource": 0, "аренда/синхронизатор": 1,
-             "нет активной услуги": 2}
+             "пользователи в Parts.Resource": 2, "нет активной услуги": 3}
     return sorted(projects, key=lambda p: (order[project_status(p, portal)], p["id"]))
 
 
@@ -513,7 +544,7 @@ def format_block(server: str, projects: list[dict], scope: str | None = None,
                  portal: dict | None = None) -> str:
     portal = portal or load_config()
     scope = scope or portal.get("scope", "active")
-    label = "неархивные" if scope == "hosted" else "активные"
+    label = {"hosted": "неархивные", "live": "активные"}.get(scope, "активные")
     if not projects:
         return f"Затронутые проекты ({server}): {label} не найдено"
     cap = int(portal.get("max_projects_per_server") or 0)
@@ -522,7 +553,9 @@ def format_block(server: str, projects: list[dict], scope: str | None = None,
     for prj in shown:
         lines.append(f"• {project_domain(prj)}")
     if len(shown) < len(projects):
-        lines.append(f"…ещё {len(projects) - len(shown)} — полный список в портале Projects")
+        lines.append(f"…ещё {len(projects) - len(shown)} — полный список в Projects / System Monitor")
+    if scope == "live" and portal.get("_sm_down"):
+        lines.append("System Monitor недоступен — учтены только активные услуги")
     return "\n".join(lines)
 
 
@@ -531,8 +564,9 @@ def main() -> int:
         description="Активные проекты сервера по порталу Projects."
     )
     ap.add_argument("--server", help="сервер, например p5ru3 или p5ru3.tradesoft.ru")
-    ap.add_argument("--scope", choices=("active", "hosted"),
+    ap.add_argument("--scope", choices=("active", "live", "hosted"),
                     help="active — только с активной услугой Parts.Resource; "
+                         "live — активная услуга или пользователи в System Monitor; "
                          "hosted — все неархивные проекты сервера")
     ap.add_argument("--json", action="store_true", help="JSON вместо текстового блока")
     ap.add_argument("--refresh", action="store_true", help="обновить кэш")
@@ -552,7 +586,7 @@ def main() -> int:
     )
     try:
         if args.all:
-            if scope == "hosted":
+            if scope in ("hosted", "live"):
                 hosts = sorted({
                     row["host"] for row in admin_table(portal, refresh=args.refresh)
                     .get("projects", []) if row.get("host")
@@ -560,8 +594,9 @@ def main() -> int:
                 for host in hosts:
                     print(format_block(
                         host,
-                        hosted_projects(host, portal, extended, args.refresh),
-                        "hosted", portal,
+                        sort_projects(projects_for_server(
+                            host, portal, extended, args.refresh, scope), portal),
+                        scope, portal,
                     ))
                     print()
                 return 0
