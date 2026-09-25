@@ -1,10 +1,15 @@
 ﻿# tasks-windows.ps1 — создание задач Планировщика Windows для мониторинга и db-clean.
 #
 # Задачи:
-#   tradesoft-pricing-alert   каждые 15 минут  — pricing_alert.py (мониторинг проценки)
-#   tradesoft-db-clean        ежедневно 03:00  — db-clean-aisql.py --commit --notify
-#   tradesoft-db-clean-retry  каждые 15 минут  — повторная очистка (маркер ретрая,
-#                                                 DB_CLEAN_RETRY=1 — тихий режим)
+#   tradesoft-pricing-alert     каждые 15 минут  — pricing_alert.py (мониторинг проценки)
+#   tradesoft-tg-support-reader ежечасно          — tg_support_alert.py (оповещения ts-support)
+#   tradesoft-db-clean          ежедневно 21:00  — db-clean-aisql.py --commit --notify
+#
+# Все задачи выполняются через pythonw.exe (GUI-подсистема) — окна консоли не
+# появляются и не мешают работе за рабочим столом.
+#
+# На Windows db-clean отправляет уведомление только при фактическом удалении БД;
+# ошибки и пустые результаты остаются в db-clean.log.
 #
 # Зависимости репозиториев на Windows (по умолчанию):
 #   %USERPROFILE%\Work\scripts\monitoring   — этот пакет + notify/pricing
@@ -25,23 +30,24 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$venvPy = "$MonitoringRepo\.venv\Scripts\python.exe"
-if (-not (Test-Path $venvPy)) { throw "venv не найден: $venvPy" }
+$venvPyw = "$MonitoringRepo\.venv\Scripts\pythonw.exe"
+if (-not (Test-Path $venvPyw)) { throw "venv pythonw не найден: $venvPyw" }
 if (-not (Test-Path $PsaRepo)) { throw "каталог parallels-sql-admins не найден: $PsaRepo" }
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 # --- env уровня пользователя (виден планировщику и скриптам) -----------------
 $env_map = @{
-    PSA_REPO               = $PsaRepo
-    B24_REPO               = $B24Repo
-    MONITORING_REPO        = $MonitoringRepo
-    TS_B24                 = "$B24Repo\scripts"
-    AISQL_HOST             = "aisql.tradesoft.corp\supportsql"
-    DB_CLEAN_LOG           = "$LogDir\db-clean.log"
-    DB_CLEAN_SIGNALS       = "$LogDir\corp-vpn-signals"
-    DB_CLEAN_RETRY_MARKER  = "$LogDir\db-clean.retry"
-    ALERTS_LOG             = "$LogDir\alerts.log"
+    PSA_REPO                  = $PsaRepo
+    B24_REPO                  = $B24Repo
+    MONITORING_REPO           = $MonitoringRepo
+    TS_B24                    = "$B24Repo\scripts"
+    AISQL_HOST                = "aisql.tradesoft.corp\supportsql"
+    DB_CLEAN_LOG              = "$LogDir\db-clean.log"
+    DB_CLEAN_SIGNALS          = "$LogDir\corp-vpn-signals"
+    DB_CLEAN_RETRY_MARKER     = "$LogDir\db-clean.retry"
+    DB_CLEAN_NOTIFY_ON_DELETE = "1"
+    ALERTS_LOG                = "$LogDir\alerts.log"
 }
 foreach ($k in $env_map.Keys) {
     [Environment]::SetEnvironmentVariable($k, $env_map[$k], "User")
@@ -50,7 +56,7 @@ foreach ($k in $env_map.Keys) {
 
 # --- задачи -----------------------------------------------------------------
 function New-Task([string]$Name, [string]$Arguments, $Trigger) {
-    $action = New-ScheduledTaskAction -Execute $venvPy -Argument $Arguments -WorkingDirectory $MonitoringRepo
+    $action = New-ScheduledTaskAction -Execute $venvPyw -Argument $Arguments -WorkingDirectory $MonitoringRepo
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger `
@@ -58,28 +64,28 @@ function New-Task([string]$Name, [string]$Arguments, $Trigger) {
     Write-Host "task created: $Name"
 }
 
-$trigAlert   = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+$trigAlert = New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes 15)
-$trigDaily   = New-ScheduledTaskTrigger -Daily -At "03:00"
-$trigRetry   = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 15)
+$trigHourly = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Hours 1)
+$trigDaily = New-ScheduledTaskTrigger -Daily -At "21:00"
 
 New-Task "tradesoft-pricing-alert" "`"$MonitoringRepo\pricing_alert.py`"" $trigAlert
+New-Task "tradesoft-tg-support-reader" "`"$MonitoringRepo\tg_support_alert.py`"" $trigHourly
 New-Task "tradesoft-db-clean" "`"$DbCleanRepo\db-clean-aisql.py`" --commit --notify" $trigDaily
 
-# retry-задача: отдельный env (DB_CLEAN_RETRY=1) через wrapper-cmd
-$retryCmd = "$LogDir\run-db-clean-retry.cmd"
-@"
-@echo off
-set DB_CLEAN_RETRY=1
-"$venvPy" "$DbCleanRepo\db-clean-aisql.py" --commit --notify %*
-"@ | Set-Content -Path $retryCmd -Encoding Ascii
-$actionRetry = New-ScheduledTaskAction -Execute $retryCmd -WorkingDirectory $MonitoringRepo
-$settingsRetry = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-    -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-Register-ScheduledTask -TaskName "tradesoft-db-clean-retry" -Action $actionRetry `
-    -Trigger $trigRetry -Settings $settingsRetry -Force | Out-Null
-Write-Host "task created: tradesoft-db-clean-retry (DB_CLEAN_RETRY=1 via wrapper)"
+$retryTaskName = "tradesoft-db-clean-retry"
+$retryTask = Get-ScheduledTask -TaskName $retryTaskName -ErrorAction SilentlyContinue
+if ($null -ne $retryTask) {
+    Stop-ScheduledTask -TaskName $retryTaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $retryTaskName -Confirm:$false
+    Write-Host "task removed: $retryTaskName"
+}
+foreach ($path in @("$PSScriptRoot\run-db-clean-retry.pyw", "$LogDir\run-db-clean-retry.cmd")) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+    }
+}
 
 Write-Host "Готово. Проверка: Get-ScheduledTask -TaskName 'tradesoft-*'"
 Write-Host "Логи: $LogDir"

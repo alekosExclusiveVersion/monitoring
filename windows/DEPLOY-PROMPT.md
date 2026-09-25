@@ -41,10 +41,9 @@ Tradesoft: (1) сторож веб-проценки (pricing-alert) и (2) ав�
 3. ЗАПУСТИ установку и создание задач:
      powershell -ExecutionPolicy Bypass -File %USERPROFILE%\Work\scripts\monitoring\windows\setup-windows.ps1
    Это создаст venv, поставит зависимости (windows/requirements.txt) и вызовет
-   tasks-windows.ps1, который зарегистрирует три задачи Планировщика:
+   tasks-windows.ps1, который    зарегистрирует две задачи Планировщика:
      tradesoft-pricing-alert   (каждые 15 мин)
-     tradesoft-db-clean        (ежедневно 03:00)
-     tradesoft-db-clean-retry  (каждые 15 мин, DB_CLEAN_RETRY=1)
+     tradesoft-db-clean        (ежедневно 21:00; уведомления только при удалении БД)
    Задачи регистрируются от текущего пользователя (интерактивная сессия).
 
 4. СЕКРЕТЫ. Это НЕ вводить через чат. Найди пусть секретов в
@@ -80,8 +79,8 @@ Tradesoft: (1) сторож веб-проценки (pricing-alert) и (2) ав�
       по расписанию, повторный ручной запуск создаст лишние алерты.
 
 7. ОТЧЁТ. Дай пользователю краткое резюме:
-   - какие задачи Планировщика созданы (3 шт), их состояние через
-     Get-ScheduledTaskInfo;
+    - какие задачи Планировщика созданы (2 шт), их состояние через
+      Get-ScheduledTaskInfo;
    - результат dry-run db-clean;
    - результат контроля pricing-alert;
    - список сервисов секретов, которые «check» подтвердил;
