@@ -51,7 +51,7 @@ DEFAULT_PORTAL: dict = {
     "groups": [1, 14],
     "extended_groups": [53, 74, 75],
     "extended": True,
-    "scope": "hosted",
+    "scope": "active",
     "max_projects_per_server": 30,
     "cache_ttl_hours": 6,
     "admin_cache_ttl_hours": 24,
@@ -498,6 +498,17 @@ def sort_projects(projects: list[dict], portal: dict) -> list[dict]:
     return sorted(projects, key=lambda p: (order[project_status(p, portal)], p["id"]))
 
 
+def project_domain(prj: dict) -> str:
+    raw = (prj.get("url") or "").strip()
+    if raw:
+        raw = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", raw).rstrip("/")
+        raw = raw.split("/")[0].split("?")[0].strip()
+        if raw:
+            return raw
+    name = (prj.get("name") or "").strip()
+    return name or str(prj.get("id", "?"))
+
+
 def format_block(server: str, projects: list[dict], scope: str | None = None,
                  portal: dict | None = None) -> str:
     portal = portal or load_config()
@@ -509,13 +520,7 @@ def format_block(server: str, projects: list[dict], scope: str | None = None,
     shown = projects if cap <= 0 else projects[:cap]
     lines = [f"Затронутые проекты ({server}, {label}, {len(projects)}):"]
     for prj in shown:
-        name = prj.get("name") or prj.get("url") or str(prj["id"])
-        url = prj.get("url") or ""
-        suffix = f" — {url}" if url else ""
-        status = project_status(prj, portal)
-        if scope == "hosted" or status != "поддержка Parts.Resource":
-            suffix += f" [{status}]"
-        lines.append(f"• {prj['id']} — {name}{suffix}")
+        lines.append(f"• {project_domain(prj)}")
     if len(shown) < len(projects):
         lines.append(f"…ещё {len(projects) - len(shown)} — полный список в портале Projects")
     return "\n".join(lines)

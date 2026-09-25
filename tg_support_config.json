@@ -55,7 +55,7 @@
     "groups": [1, 14],
     "extended_groups": [53, 74, 75],
     "extended": true,
-    "scope": "hosted",
+    "scope": "active",
     "max_projects_per_server": 30,
     "cache_ttl_hours": 6,
     "admin_cache_ttl_hours": 24,
