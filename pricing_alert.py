@@ -387,8 +387,12 @@ def _runs_phase2(cur_from: int, cur_to: int) -> tuple[list[str], float]:
     return lines, top_to
 
 
-def _build_message(det: dict, cfg: dict, t_from: int, t_to: int, top_timeouts: float = 0.0) -> str:
-    lines = [f"\U000026a0\ufe0f Веб-проценка замедлилась · {_timepoint(t_from)}–{_timepoint(t_to)}"]
+def _build_message(det: dict, cfg: dict, t_from: int, t_to: int,
+                   top_timeouts: float = 0.0, headline: str | None = None) -> str:
+    if headline is None:
+        headline = (f"\U000026a0\ufe0f Веб-проценка замедлилась · "
+                    f"{_timepoint(t_from)}–{_timepoint(t_to)}")
+    lines = [headline]
     summary = []
     if det["runtime"]:
         n = len(det["runtime"])
@@ -455,7 +459,10 @@ def _build_recovery_message(cur: dict, base: dict, cfg: dict,
         rows.append(f"запросы/ч\t{_fmt_int(cv['n'])} (эталон {_fmt_int(bv['n'])})")
         rows.append(f"среднее\t{cv.get('avg_t') or 0:.1f} с (эталон {bv.get('avg_t') or 0:.1f} с)")
         if cv.get("p99"):
-            rows.append(f"p99\t{cv['p99']:.1f} с")
+            rows.append(
+                "время ответа (99%)\t"
+                f"{cv['p99']:.1f} с или быстрее; только 1% запросов — дольше"
+            )
 
     # среднее по всем runtime-провайдерам (без лимита)
     rt = cur["runtime"]
@@ -538,9 +545,10 @@ def main() -> int:
     last = datetime.strptime(state["last_notify"], "%Y-%m-%d %H:%M:%S")
     if hours >= 1 and (datetime.now() - last).total_seconds() >= escalate_every * 3600:
         _attach_trends(cfg, det, cur_from, cur_to)
-        body = (f"\U000026a0\ufe0f Веб-проценка замедлена уже {hours} ч "
-                f"(с {state['active_since']})\n\n")
-        body += _build_message(det, cfg, cur_from, cur_to, top_timeouts=0.0)
+        headline = (f"\U000026a0\ufe0f Веб-проценка замедлена уже {hours} ч "
+                    f"(с {state['active_since']})")
+        body = _build_message(det, cfg, cur_from, cur_to,
+                              top_timeouts=0.0, headline=headline)
         _notify(body, "pricing-alert: инцидент продолжается")
         _save_state({**state, "last_notify": now_s, "alerted_hours": hours})
     print(f"{_ts()} продолжается (часов: {hours})")
