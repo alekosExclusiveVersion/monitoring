@@ -20,8 +20,8 @@
   | Задача | Расписание | Команда |
   |---|---|---|
   | `tradesoft-pricing-alert` | каждые 15 мин | `pricing_alert.py` |
-  | `tradesoft-db-clean` | ежедневно 03:00 | `db-clean-aisql.py --commit --notify` |
-  | `tradesoft-db-clean-retry` | каждые 15 мин | `db-clean-aisql.py --commit --notify` (DB_CLEAN_RETRY=1) |
+  | `tradesoft-tg-support-reader` | ежечасно | `tg_support_alert.py` |
+  | `tradesoft-db-clean` | ежедневно 21:00 | `db-clean-aisql.py --commit --notify` |
 
 - **БД-доступ** — данные приложения PSA лежат в
   `%APPDATA%\Parallels SQL Admin\` (servers.json + servers.key). Ключ — Fernet
@@ -37,9 +37,47 @@
 - `monitoring/detect_pricing_degradation.py` — данные PSA через
   `common.paths.app_data_dir()` (кроссплатформенный каталог).
 - `db-clean/db-clean-aisql.py` — `--notify` шлёт события в B24/Telegram напрямую
-  (без macOS-агента corp-notify.sh); RETRY-маркер под env; B24-секреты — из
-  Credential Manager, если нет `.env`.
+  (без macOS-агента corp-notify.sh); на Windows `DB_CLEAN_NOTIFY_ON_DELETE=1`
+  ограничивает уведомления фактическим удалением БД; RETRY-маркер под env;
+  B24-секреты — из Credential Manager, если нет `.env`.
 - `ts-b24/scripts/b24_client.py` — поддержал B24_BASE_URL/B24_WEBHOOK_TOKEN из env.
+
+## Оповещения по группе ts-support
+
+- `tg_support_read.py` — чтение `getUpdates` ботом-читателем
+  (`opencode.tg-support-reader-token`, privacy выключен), offset в
+  `logs\tg_support_reader_state.json`; вручную: `--follow`, `--reset`.
+- `tg_support_alert.py` — разовый опрос (тот же offset), матчинг ключевых слов и
+  серверов из `tg_support_config.json`, отправка через `notify.notify_all`
+  (B24 `chat123028` + Telegram 4385) от alert-бота `opencode.tg-alert-token`.
+  Состояние: `logs\tg_support_sent.json` (дедуп по `message_id`, cooldown),
+  `logs\tg_support.lock`, журнал `logs\tg_support_alert.log`.
+- `prj_active_projects.py` — проекты сервера из портала Projects
+  (`http://www.projects.prj`): read-only POST `schedule.html`
+  (`filter=active`, `cst_string=%`, `srv_srg_id[]=1|14|53|74|75`) + проверка
+  `prj_archive`; для `scope=hosted` дополнительно полный реестр
+  `admin/projects.html` (`pg_count` из `admin_page_size`, 12 838 проектов).
+  Кэши: `logs\prj_projects_cache.json` (TTL `cache_ttl_hours`),
+  `logs\prj_admin_projects.json` (TTL `admin_cache_ttl_hours`),
+  `logs\prj_archive_cache.json` (TTL `archive_cache_ttl_hours`, по проекту).
+  Системный прокси игнорируется. Секреты: `opencode.projects.prj-login-user`,
+  `opencode.projects.prj-login`.
+- Состав блока «Затронутые проекты»: `scope=hosted` (по умолчанию) — все
+  неархивные проекты сервера, с меткой `[поддержка Parts.Resource]`,
+  `[аренда/синхронизатор]` (группы 53/74/75) или `[нет активной услуги]`;
+  `scope=active` — только проекты с активной услугой групп 1/14.
+  Не более `max_projects_per_server` строк, остальные свернуты.
+  Группы 53/74/75 учитываются по умолчанию (`projects_portal.extended`),
+  отключаются `--no-extended`.
+- Сообщение = текст триггера, автор, время, блок «Затронутые проекты» на каждый
+  упомянутый сервер и ссылка на исходное сообщение; при недоступности портала
+  уведомление уходит без списка.
+- Проверка вручную:
+  ```powershell
+  .venv\Scripts\python.exe tg_support_read.py --follow
+  .venv\Scripts\python.exe tg_support_alert.py --dry-run
+  .venv\Scripts\python.exe prj_active_projects.py --server p5ru3
+  ```
 
 ## Порядок установки (на Windows-машине)
 
@@ -62,6 +100,10 @@
    echo "<secret>" | py windows/win_secrets.py set opencode.tg-alert-token
    py windows/win_secrets.py set opencode.tg-alert-chat2
    py windows/win_secrets.py set opencode.tg-alert-thread
+   py windows/win_secrets.py set opencode.tg-support-reader-token
+   py windows/win_secrets.py set opencode.tg-support-chat
+   py windows/win_secrets.py set opencode.projects.prj-login-user
+   py windows/win_secrets.py set opencode.projects.prj-login
    py windows/win_secrets.py set opencode.grafana.login
    py windows/win_secrets.py set opencode.grafana.password
    py windows/win_secrets.py set opencode.ts-b24.base-url
@@ -127,5 +169,6 @@
   если демоны ещё живы на обеих машинах.
 - **pricing-alert** посылает алерты только если в момент запуска машина онлайн;
   обратную засылку проспанных окон не делает (как и на macOS).
-- **db-clean retry**: маркер живёт в `%USERPROFILE%\Work\logs` (env
-  `DB_CLEAN_RETRY_MARKER`), а не `/var/run` как на macOS.
+- **db-clean на Windows**: автоматического retry нет; ошибки и пустые результаты
+  остаются в `%USERPROFILE%\Work\logs\db-clean.log`, уведомления приходят только
+  после фактического удаления БД.
