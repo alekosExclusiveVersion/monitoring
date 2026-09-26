@@ -11,8 +11,13 @@ Telegram) с гиперссылками на дашборд Grafana за окн�
              и в increase_factor раз больше нормы; затронуто не менее
              min_runtime_providers поставщиков;
   errors   — доля ответов поставщиков с кодом >=500 >= errors_abs_pct
-             и в increase_factor раз больше нормы;
+             и в increase_factor раз больше нормы; затронуто не менее
+             min_error_providers поставщиков;
   volume   — запросов проценки упало ниже (1 - volume_drop) от нормы.
+
+Пороги числа поставщиков (min_runtime_providers, min_error_providers) отсекают
+локальные сбои отдельных поставщиков: уведомление только о глобальной деградации.
+Каждое решение детектора пишется в logs/pricing_alert_events.jsonl.
 
 Дедупликация: уведомляем при старте инцидента, затем раз в escalate_every
 часов («продолжается N ч»), при восстановлении — «всё нормально».
@@ -44,6 +49,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 CONFIG = REPO / "pricing_alert_config.json"
 STATE = REPO / "logs" / "pricing_alert_state.json"
+EVENTS_LOG = REPO / "logs" / "pricing_alert_events.jsonl"
 
 sys.path.insert(0, str(REPO))
 from notify import secret_get, notify_all  # noqa: E402
@@ -73,6 +79,7 @@ def _load_config() -> dict:
         "runtime_abs_sec": 15.0,
         "min_runtime_providers": 3,
         "errors_abs_pct": 5.0,
+        "min_error_providers": 3,
         "volume_drop": 0.7,
         "escalate_every_hours": 1.0,
         "window_seconds": WINDOW_SEC,
@@ -97,6 +104,55 @@ def _save_state(state: dict) -> None:
     tmp = STATE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, STATE)
+
+
+def _log_event(decision: str, cur: dict, base: dict, det: dict,
+               cfg: dict, t_from: int, t_to: int) -> None:
+    """Безусловная запись решения детектора в logs/pricing_alert_events.jsonl.
+
+    Пишется на каждом запуске, включая «норма», в отличие от alerts.log,
+    который создаётся только при сбое доставки уведомления.
+    """
+    fired = [k for k in ("runtime", "errors", "volume") if det.get(k)]
+    record = {
+        "ts": _ts(),
+        "window": f"{_timepoint(t_from)}-{_timepoint(t_to)}",
+        "t_from": t_from,
+        "t_to": t_to,
+        "eligible": {
+            "runtime": len(cur.get("runtime", {})),
+            "errors": len(cur.get("errors", {})),
+        },
+        "thresholds": {
+            "runtime_abs_sec": cfg.get("runtime_abs_sec"),
+            "min_runtime_providers": int(cfg.get("min_runtime_providers", 3)),
+            "errors_abs_pct": cfg.get("errors_abs_pct"),
+            "min_error_providers": int(cfg.get("min_error_providers", 3)),
+            "increase_factor": cfg.get("increase_factor"),
+            "volume_drop": cfg.get("volume_drop"),
+        },
+        "signals": {
+            "runtime": {
+                "n": len(det.get("runtime", [])),
+                "providers": [r["provider"] for r in det.get("runtime", [])],
+            },
+            "errors": {
+                "n": len(det.get("errors", [])),
+                "providers": [e["provider"] for e in det.get("errors", [])],
+            },
+            "volume": {"fired": bool(det.get("volume")),
+                       "ratio": (det.get("volume") or {}).get("ratio")},
+        },
+        "suppressed": det.get("suppressed", {}),
+        "fired": fired,
+        "decision": decision,
+    }
+    try:
+        EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with EVENTS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"{_ts()} не удалось записать журнал событий: {e}")
 
 
 def _grafana_query(cfg: dict, raw_query: str, t_from: int, t_to: int) -> list[tuple[str, list]]:
@@ -263,7 +319,7 @@ def _sparkline(avg_list: list) -> str:
 
 def _detect(cur: dict, base: dict, cfg: dict) -> dict:
     factor = cfg.get("increase_factor", 3.0)
-    res = {"runtime": [], "errors": [], "volume": {}}
+    res = {"runtime": [], "errors": [], "volume": {}, "suppressed": {}}
 
     for provider, r in sorted(cur["runtime"].items(), key=lambda kv: -kv[1]["avg_r"]):
         b = base["runtime"].get(provider)
@@ -278,10 +334,6 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
                 "ratio": round(float(r["avg_r"]) / float(b["avg_r"]), 1),
                 "n": int(r["n"]),
             })
-
-    min_runtime_providers = int(cfg.get("min_runtime_providers", 3))
-    if len(res["runtime"]) < min_runtime_providers:
-        res["runtime"] = []
 
     for provider, r in sorted(cur["errors"].items(), key=lambda kv: -kv[1]["e"]):
         base_n = base["errors"].get(provider, {}).get("n", 0)
@@ -310,6 +362,20 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
                 "avg": round(float(cv.get("avg_t") or 0), 2),
                 "p99": round(float(cv.get("p99") or 0), 2),
             }
+
+    # Пороги числа поставщиков: локальный сбой одного поставщика — не инцидент.
+    # Подавленные сигналы сохраняем, чтобы решение было видно в журнале событий.
+    for key, cfg_key, default in (("runtime", "min_runtime_providers", 3),
+                                  ("errors", "min_error_providers", 3)):
+        minimum = int(cfg.get(cfg_key, default))
+        if len(res[key]) < minimum:
+            if res[key]:
+                res["suppressed"][key] = {
+                    "n": len(res[key]),
+                    "min": minimum,
+                    "providers": [r["provider"] for r in res[key]],
+                }
+            res[key] = []
     return res
 
 
@@ -525,6 +591,8 @@ def main() -> int:
             _notify(body, "pricing-alert: восстановлено")
         _save_state({"active": False, "active_since": "", "last_notify": "",
                      "alerted_hours": 0})
+        _log_event("recovery" if state.get("active") else "normal",
+                   cur, base, det, cfg, cur_from, cur_to)
         print(f"{_ts()} норма")
         return 0
 
@@ -541,6 +609,7 @@ def main() -> int:
         _notify(lines, "pricing-alert: проценка замедлилась")
         _save_state({"active": True, "active_since": now_s, "last_notify": now_s,
                      "alerted_hours": 0})
+        _log_event("incident", cur, base, det, cfg, cur_from, cur_to)
         print(f"{_ts()} ИНЦИДЕНТ: {len(det['runtime'])} runtime, "
               f"{len(det['errors'])} errors, volume={bool(det['volume'])}")
         return 0
@@ -549,6 +618,7 @@ def main() -> int:
         state["active_since"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600)
     escalate_every = float(cfg.get("escalate_every_hours", 1.0))
     last = datetime.strptime(state["last_notify"], "%Y-%m-%d %H:%M:%S")
+    escalated = False
     if hours >= 1 and (datetime.now() - last).total_seconds() >= escalate_every * 3600:
         _attach_trends(cfg, det, cur_from, cur_to)
         headline = (f"\U000026a0\ufe0f Веб-проценка замедлена уже {hours} ч "
@@ -557,6 +627,9 @@ def main() -> int:
                               top_timeouts=0.0, headline=headline)
         _notify(body, "pricing-alert: инцидент продолжается")
         _save_state({**state, "last_notify": now_s, "alerted_hours": hours})
+        escalated = True
+    _log_event("escalation" if escalated else "ongoing",
+               cur, base, det, cfg, cur_from, cur_to)
     print(f"{_ts()} продолжается (часов: {hours})")
     return 0
 

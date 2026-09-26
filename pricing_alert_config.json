@@ -3,6 +3,7 @@
   "runtime_abs_sec": 15.0,
   "min_runtime_providers": 3,
   "errors_abs_pct": 5.0,
+  "min_error_providers": 3,
   "volume_drop": 0.7,
   "escalate_every_hours": 1.0,
   "window_seconds": 3600
