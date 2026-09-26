@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """tg_support_alert.py — оповещения по сообщениям группы ts-support.
 
-Один опрос getUpdates ботом-читателем: сообщения с ключевыми словами или именем
-сервера превращаются в уведомление через notify.notify_all (B24 chat123028 +
-Telegram-комната 4385). Для каждого упомянутого в сообщении сервера добавляется
-блок «Затронутые проекты» из портала Projects (prj_active_projects): в одном
-уведомлении только те серверы, что реально названы в тексте.
+Один опрос getUpdates ботом-читателем: вид сообщения определяет msg_parse
+.classify() — инцидент, восстановление или «в shadow-лог». Уведомления уходят
+через notify.notify_all (B24 chat123028 + Telegram-комната 4385). Для каждого
+сервера, названного в сообщении или подобранного из цепочки инцидента,
+добавляется блок «Затронутые проекты» из портала Projects
+(prj_active_projects): в одном уведомлении только эти серверы.
 
 Сообщения не от «своих» авторов уведомлений не дают: подходит username из
 author_usernames либо пометка из author_marks (по умолчанию «Сис. админ») в
@@ -16,16 +17,25 @@ username, first_name, last_name автора или в начале текста
 (по умолчанию 60) они пропускаются как старые инциденты, --max-age меняет
 порог, 0 — без ограничения.
 
-Сообщения о восстановлении (раздел resolved в конфиге: «восстановлен»,
-«снова онлайн», «заработал», «работы завершены» и т.п.) транслируются как
-✅ «онлайн» в те же каналы; отдельный cooldown resolved.cooldown_seconds,
-свой блок проектов по умолчанию не добавляется (resolved.include_projects).
-Признак проблемы важнее: если в тексте есть problem_hints («не отвечает»,
-«не онлайн»), сообщение уходит как инцидент, а не как восстановление.
+Цепочка инцидента (chain): отправленное уведомление-инцидент открывает сервер
+в logs/tg_support_chain.json, поэтому «восстановили» без названия сервера
+достраивается до последнего открытого сервера, а «опять лежит» — до него же.
+Восстановление закрывает цепочку. Окно chain.window_minutes (720 по умолчанию),
+при необходимости сервер уточняется названным доменом проекта
+(chain.match_by_project).
+
+Восстановление (resolved) транслируется как ✅ «онлайн»; resolved.include_projects
+= auto добавляет блок проектов, если сервер подобран из цепочки или в тексте
+есть слова про проекты/сайты. Отдельный cooldown resolved.cooldown_seconds.
+
+Всё, что не распознано, но пришло от доверенного автора, пишется в shadow-лог
+(logs/tg_support_unmatched.jsonl) — по нему словари дополняются фактическими
+формулировками; --shadow показывает последние записи.
 
 Состояние:
   logs/tg_support_reader_state.json — offset getUpdates (tg_support_read);
   logs/tg_support_sent.json         — дедуп по message_id и cooldown;
+  logs/tg_support_chain.json        — открытые инциденты по серверам;
   logs/tg_support.lock              — защита от параллельного запуска;
   logs/tg_support_alert.log         — журнал запусков.
 
@@ -35,7 +45,8 @@ username, first_name, last_name автора или в начале текста
   --reset          сбросить offset перед опросом;
   --no-extended    блок проектов только по группам 1/14 (без 53/74/75);
   --any-author     не фильтровать по автору (author_marks/author_usernames);
-  --max-age N      порог возраста сообщения, мин (0 — без ограничения).
+  --max-age N      порог возраста сообщения, мин (0 — без ограничения);
+  --shadow [N]     показать последние N записей shadow-лога (по умолчанию 20).
 """
 
 from __future__ import annotations
@@ -43,12 +54,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import msg_parse
 import prj_active_projects as prj
 from notify import notify_all, secret_get
 from tg_support_read import (
@@ -67,7 +78,7 @@ LOG_FILE = BASE_DIR / "logs" / "tg_support_alert.log"
 FMT = "%Y-%m-%d %H:%M:%S"
 MAX_TEXT = 3500
 STALE_LOCK_SEC = 3600
-PUNCT_RE = re.compile(r"[^\w\s-]", re.UNICODE)
+PLURAL_HINTS = ("серверы", "сервера", "проекты онлайн", "сайты работают")
 
 
 def load_config() -> dict:
@@ -138,48 +149,122 @@ def prune_sent(state: dict, days: int) -> None:
                 state[key].pop(name, None)
 
 
-def normalize(text: str) -> str:
-    return PUNCT_RE.sub(" ", text.lower()).split()
+def load_chain(cfg: dict) -> dict:
+    path = BASE_DIR / (cfg.get("chain") or {}).get("file", "logs/tg_support_chain.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"servers": {}}
+    data.setdefault("servers", {})
+    return data
+
+
+def save_chain(chain: dict, cfg: dict) -> None:
+    path = BASE_DIR / (cfg.get("chain") or {}).get("file", "logs/tg_support_chain.json")
+    window = int((cfg.get("chain") or {}).get("window_minutes", 720))
+    cutoff = datetime.now() - timedelta(minutes=window)
+    for server, entry in list(chain["servers"].items()):
+        if entry.get("closed"):
+            try:
+                if datetime.strptime(entry["closed"], FMT) < cutoff:
+                    chain["servers"].pop(server, None)
+            except (KeyError, ValueError):
+                chain["servers"].pop(server, None)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(chain, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        log(f"цепочка не сохранена: {e}")
+
+
+def chain_candidates(chain: dict, cfg: dict) -> list[dict]:
+    """Открытые инциденты, свежие по окну chain.window_minutes, свежие первыми."""
+    window = int((cfg.get("chain") or {}).get("window_minutes", 720))
+    cutoff = datetime.now() - timedelta(minutes=window)
+    out = []
+    for server, entry in chain.get("servers", {}).items():
+        if entry.get("closed"):
+            continue
+        try:
+            since = datetime.strptime(entry["since"], FMT)
+        except (KeyError, ValueError):
+            continue
+        if since >= cutoff:
+            out.append({"server": server, **entry})
+    out.sort(key=lambda item: item["since"], reverse=True)
+    return out
+
+
+def server_by_project(text: str, servers: list[str], portal: dict,
+                      extended: bool) -> str | None:
+    """Уточнить сервер по названному в тексте домену его проектов."""
+    flat = " ".join(msg_parse.tokens(text))
+    if not flat:
+        return None
+    for server in servers:
+        try:
+            projects = prj.projects_for_server(server, portal, extended=extended)
+        except RuntimeError:
+            continue
+        for project in projects:
+            if " ".join(msg_parse.tokens(project["name"])) in flat:
+                return server
+    return None
+
+
+def shadow_path(cfg: dict) -> Path:
+    return BASE_DIR / (cfg.get("shadow") or {}).get(
+        "file", "logs/tg_support_unmatched.jsonl")
+
+
+def shadow_log(entry: dict, cfg: dict) -> None:
+    section = cfg.get("shadow") or {}
+    if not section.get("enabled", True):
+        return
+    path = shadow_path(cfg)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log(f"shadow-лог недоступен: {e}")
+        return
+    max_lines = int(section.get("max_lines", 5000))
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > max_lines:
+            path.write_text("\n".join(lines[-max_lines:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def show_shadow(count: int, cfg: dict) -> int:
+    path = shadow_path(cfg)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        print(f"shadow-лог недоступен: {e}")
+        return 1
+    if not lines:
+        print("shadow-лог пуст")
+        return 0
+    for raw in lines[-count:]:
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        print("%s | %-8s | %-18s | %s%s" % (
+            entry.get("ts", "?"), entry.get("reason", "?"),
+            entry.get("author", "?")[:18], (entry.get("text") or "")[:90],
+            (" | серверы: " + ",".join(entry.get("servers") or []))
+            if entry.get("servers") else ""))
+    print(f"всего записей: {len(lines)}, показано: {min(count, len(lines))}")
+    return 0
 
 
 def is_ignored(text: str, cfg: dict) -> bool:
-    flat = " ".join(normalize(text))
-    return flat in {" ".join(normalize(p)) for p in cfg.get("ignore_exact", [])}
-
-
-def detect_servers(text: str, cfg: dict) -> list[str]:
-    found: list[tuple[int, str]] = []
-    for stem in cfg.get("server_stems", []):
-        pattern = rf"(?<![A-Za-z0-9]){re.escape(stem)}(?![A-Za-z0-9])"
-        match = re.search(pattern, text, re.I)
-        if match:
-            found.append((match.start(), match.group(0).lower()))
-    found.sort()
-    ordered: list[str] = []
-    for _, stem in found:
-        if stem not in ordered:
-            ordered.append(stem)
-    return ordered
-
-
-def find_hits(text: str, cfg: dict) -> list[str]:
-    low = text.lower()
-    hits = [kw for kw in cfg.get("keywords", []) if kw.lower() in low]
-    return hits + detect_servers(text, cfg)
-
-
-def find_resolved(text: str, cfg: dict) -> list[str]:
-    """Признаки восстановления; признак проблемы важнее признака восстановления."""
-    section = cfg.get("resolved") or {}
-    if not section.get("enabled", True):
-        return []
-    low = text.lower()
-    hits = [kw for kw in section.get("keywords", []) if kw.lower() in low]
-    if not hits:
-        return []
-    if any(hint.lower() in low for hint in section.get("problem_hints", [])):
-        return []
-    return hits
+    flat = " ".join(msg_parse.tokens(text))
+    return flat in {" ".join(msg_parse.tokens(p)) for p in cfg.get("ignore_exact", [])}
 
 
 def message_link(msg: dict) -> str:
@@ -207,7 +292,7 @@ def author_name(msg: dict) -> str:
 
 def mark_key(text: str) -> str:
     """Ключ для сравнения пометок: регистр, пробелы и точки не важны."""
-    return re.sub(r"\W", "", str(text).lower(), flags=re.UNICODE)
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
 
 
 def marked_author(msg: dict, text: str, cfg: dict) -> bool:
@@ -311,18 +396,37 @@ def fetch_updates(token: str, offset: int, limit: int) -> tuple[list[dict], int]
     return updates, new_offset
 
 
+def want_projects(text: str, cfg: dict, inferred: bool) -> bool:
+    """include_projects: true / false / auto — блок проектов в сообщении о
+    восстановлении. В auto блок есть, если сервер подобран из цепочки или в
+    тексте прямо сказано про проекты/сайты («сервер и проекты онлайн»)."""
+    setting = (cfg.get("resolved") or {}).get("include_projects", "auto")
+    if isinstance(setting, bool):
+        return setting
+    if inferred:
+        return True
+    return bool(msg_parse.match_phrases(
+        text, ("проект", "проекты", "сайт", "сайты", "магазин", "магазины")))
+
+
 def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
-            extended: bool, dry_run: bool, any_author: bool = False,
-            max_age: int | None = None) -> tuple[int, dict]:
+            chain: dict, extended: bool, dry_run: bool, any_author: bool = False,
+            max_age: int | None = None) -> tuple[int, dict, int]:
     sent = 0
     skipped: dict[str, int] = {}
     stale = 0
+    shadow = 0
     restored = 0
+    portal = prj.load_config()
     limit = int(cfg.get("max_messages_per_run", 5))
     age_limit = int(cfg.get("max_message_age_minutes", 60) if max_age is None else max_age)
     resolved_cfg = cfg.get("resolved") or {}
+    resolved_enabled = resolved_cfg.get("enabled", True)
     resolved_cooldown = int(resolved_cfg.get("cooldown_seconds", 900))
-    include_projects = bool(resolved_cfg.get("include_projects", False))
+    chain_cfg = cfg.get("chain") or {}
+    chain_enabled = bool(chain_cfg.get("enabled", True))
+    match_by_project = bool(chain_cfg.get("match_by_project", True))
+    chain_to_incidents = bool(chain_cfg.get("apply_to_incidents", True))
     for update in updates:
         kind = next((k for k in update if k != "update_id"), "")
         if kind not in {"message", "edited_message"}:
@@ -339,27 +443,61 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         if age is not None:
             stale += 1
             continue
-        back_hits = find_resolved(text, cfg)
-        if not back_hits and is_ignored(text, cfg):
+        verdict = msg_parse.classify(text, cfg)
+        if verdict["kind"] in ("restore", "restore_noserver") and not resolved_enabled:
+            verdict = {"kind": "shadow", "hits": verdict["hits"],
+                       "servers": verdict["servers"], "reason": "resolved_disabled"}
+        trusted = any_author or marked_author(msg, text, cfg)
+        if not trusted:
+            if verdict["kind"] not in ("shadow",):
+                name = author_name(msg)
+                skipped[name] = skipped.get(name, 0) + 1
             continue
-        hits = [] if back_hits else find_hits(text, cfg)
-        if not hits and not back_hits:
-            continue
-        if not any_author and not marked_author(msg, text, cfg):
-            name = author_name(msg)
-            skipped[name] = skipped.get(name, 0) + 1
+        if is_ignored(text, cfg):
             continue
         msg_id = str(msg.get("message_id") or update["update_id"])
         if msg_id in state["messages"]:
             continue
-        servers = detect_servers(text, cfg)
-        if back_hits and not servers:
-            log(f"пропущено: восстановление без сервера: {text[:60]}")
+        kind_out = verdict["kind"]
+        servers = list(verdict["servers"])
+        inferred = False
+        if kind_out in ("restore_noserver", "incident") and not servers and chain_enabled:
+            if chain_to_incidents or kind_out == "restore_noserver":
+                open_servers = chain_candidates(chain, cfg)
+                if open_servers:
+                    names = [item["server"] for item in open_servers]
+                    plural = bool(msg_parse.match_phrases(text, PLURAL_HINTS))
+                    if match_by_project:
+                        found = server_by_project(text, names, portal, extended)
+                        if found:
+                            servers = [found]
+                            log(f"сервер уточнён по домену проекта: {found}")
+                    if not servers:
+                        servers = names if plural else [names[0]]
+                        if len(servers) > 1:
+                            log(f"по цепочке подставлено серверов: {len(servers)} "
+                                f"({', '.join(servers)})")
+                    inferred = True
+                    if kind_out == "restore_noserver":
+                        kind_out = "restore"
+        if kind_out == "shadow":
+            shadow_log({
+                "ts": datetime.now().strftime(FMT),
+                "author": author_name(msg),
+                "username": (msg.get("from") or {}).get("username"),
+                "text": text[:500],
+                "servers": servers,
+                "reason": verdict["reason"],
+                "hits": verdict["hits"][:10],
+                "link": message_link(msg),
+            }, cfg)
+            shadow += 1
             continue
         signature = ",".join(servers) or "-"
-        prefix = "back:" if back_hits else ""
+        prefix = "back:" if kind_out == "restore" else ""
         last = state["cooldown"].get(prefix + signature)
-        cooldown = resolved_cooldown if back_hits else int(cfg.get("cooldown_seconds", 300))
+        cooldown = resolved_cooldown if kind_out == "restore" else int(
+            cfg.get("cooldown_seconds", 300))
         now = datetime.now()
         if last and cooldown > 0:
             try:
@@ -369,13 +507,24 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
                     continue
             except ValueError:
                 pass
-        if back_hits:
-            log(f"восстановление {signature} ({', '.join(back_hits)}): {text[:120]}")
-            send(build_resolved(msg, servers, extended, include_projects), dry_run)
+        if kind_out == "restore":
+            log(f"восстановление {signature} ({', '.join(verdict['hits'])}): {text[:120]}")
+            send(build_resolved(msg, servers, extended,
+                                want_projects(text, cfg, inferred)), dry_run)
+            for server in servers:
+                if server in chain.get("servers", {}):
+                    chain["servers"][server]["closed"] = now.strftime(FMT)
             restored += 1
         else:
-            log(f"срабатывание {signature}: {text[:120]}")
+            tag = " (сервер из цепочки)" if inferred else ""
+            log(f"срабатывание {signature}{tag}: {text[:120]}")
             send(build_message(msg, servers, extended), dry_run)
+            for server in servers:
+                entry = chain.setdefault("servers", {}).setdefault(server, {})
+                entry["since"] = now.strftime(FMT)
+                entry["message_id"] = msg_id
+                entry["text"] = text[:200]
+                entry.pop("closed", None)
         state["messages"][msg_id] = now.strftime(FMT)
         state["cooldown"][prefix + signature] = now.strftime(FMT)
         sent += 1
@@ -383,8 +532,10 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
             break
     if stale:
         log(f"пропущено: старше {age_limit} мин — {stale}")
+    if shadow:
+        log(f"shadow-лог: {shadow} нераспознанных сообщений")
     log(f"уведомлений: {sent} (из них о восстановлении: {restored})")
-    return sent, skipped
+    return sent, skipped, shadow
 
 
 def main() -> int:
@@ -394,13 +545,17 @@ def main() -> int:
     ap.add_argument("--no-extended", action="store_true",
                     help="только группы 1/14 в блоке проектов")
     ap.add_argument("--any-author", action="store_true",
-                    help="не фильтровать по пометке автора (author_marks)")
+                    help="не фильтровать по автору (author_marks/author_usernames)")
     ap.add_argument("--max-age", type=int, default=None,
                     help="максимальный возраст сообщения, мин (0 — без ограничения)")
+    ap.add_argument("--shadow", nargs="?", const=20, type=int, default=None,
+                    metavar="N", help="показать последние N записей shadow-лога")
     ap.add_argument("--limit", type=int, default=100, help="апдейтов за опрос")
     args = ap.parse_args()
 
     cfg = load_config()
+    if args.shadow is not None:
+        return show_shadow(args.shadow, cfg)
     extended = prj.resolve_extended(prj.load_config(), None if not args.no_extended else False)
     if not acquire_lock():
         log("пропуск: другой запуск уже работает")
@@ -415,17 +570,19 @@ def main() -> int:
         updates, new_offset = fetch_updates(token, offset, args.limit)
         state = load_sent()
         prune_sent(state, int(cfg.get("dedupe_days", 7)))
-        sent, skipped = process(updates, chat_id, cfg, state, extended,
-                                args.dry_run, args.any_author, args.max_age)
+        chain = load_chain(cfg)
+        sent, skipped, shadow = process(updates, chat_id, cfg, state, chain, extended,
+                                        args.dry_run, args.any_author, args.max_age)
         if skipped:
             log("пропущено без пометки автора: %d (%s)" % (
                 sum(skipped.values()),
                 ", ".join("%s×%d" % (name, count) for name, count in sorted(skipped.items()))))
         if args.dry_run:
-            log("dry-run: offset и дедуп не сохранялись")
+            log("dry-run: offset, дедуп и цепочка не сохранялись")
         else:
             save_offset(new_offset)
             save_sent(state)
+            save_chain(chain, cfg)
         log(f"апдейтов: {len(updates)}, уведомлений: {sent}, offset: {new_offset}")
     except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
         log(f"Ошибка опроса: {e}")

@@ -51,10 +51,11 @@
 - `tg_support_read.py` — чтение `getUpdates` ботом-читателем
   (`opencode.tg-support-reader-token`, privacy выключен), offset в
   `logs\tg_support_reader_state.json`; вручную: `--follow`, `--reset`.
-- `tg_support_alert.py` — разовый опрос (тот же offset), матчинг ключевых слов и
-  серверов из `tg_support_config.json`, отправка через `notify.notify_all`
-  (B24 `chat123028` + Telegram 4385) от alert-бота `opencode.tg-alert-token`.
-  Состояние: `logs\tg_support_sent.json` (дедуп по `message_id`, cooldown),
+- `tg_support_alert.py` — разовый опрос (тот же offset), разбор сообщений
+  модулем `msg_parse.py` по словарям `tg_support_config.json`, отправка через
+  `notify.notify_all` (B24 `chat123028` + Telegram 4385) от alert-бота
+  `opencode.tg-alert-token`. Состояние: `logs\tg_support_sent.json` (дедуп по
+  `message_id`, cooldown), `logs\tg_support_chain.json` (открытые инциденты),
   `logs\tg_support.lock`, журнал `logs\tg_support_alert.log`.
 - Отбор сообщений (всё настраивается в `tg_support_config.json`):
   - `author_marks` — уведомление дают только сообщения авторов с пометкой
@@ -69,15 +70,39 @@
   - `max_messages_per_run` (5) и `cooldown_seconds` (300 на подпись серверов) —
     защита от серии однотипных уведомлений.
 - В одном уведомлении только серверы, реально названные в тексте сообщения.
+- Разбор сообщений (`msg_parse.py`, без LLM и без нечётких сравнений):
+  - нормализация: регистр, `ё→е`, `й→и` с восстановлением мягкого знака,
+    омоглифы кириллицы/латиницы, пунктуация и разделители в именах серверов
+    (`p7-ru1`, `p7.ru1`, `P7RU 3` → `p7ru3`);
+  - словари `incident` (слова, основы `stems`, фразы `phrases`), `resolved`
+    и `planned` в конфиге; совпадение по целому слову, поэтому «диск» не ловит
+    «дискетту», а «код 500» не ловит «1500»;
+  - приоритет: проблема важнее восстановления, плановые работы подавляют
+    сообщение, кроме случаев «начинаются/начали работы … уже не отвечает»
+    (`planned.override`);
+  - `ignore_exact` — короткие реплики целиком («ок», «спасибо», «работает»).
+- Shadow-лог (раздел `shadow` в конфиге): сообщения без явного события не
+  отправляются, а пишутся в `logs\tg_support_unmatched.jsonl` с причиной
+  (`server_only`, `planned`, `no_hits`, `restore_noserver`) — по нему словари
+  пополняются. Просмотр: `tg_support_alert.py --shadow [N]`.
 - Восстановление (раздел `resolved` в конфиге): сообщения о возврате сервера в
   работу — «восстановлен», «снова онлайн», «заработал», «подняли»,
   «работы завершены» и т.п. — транслируются как `✅ … онлайн` в те же каналы
-  (B24 + Telegram), с текстом автора и ссылкой на сообщение. Блок проектов по
-  умолчанию не добавляется (`resolved.include_projects`); свой cooldown
+  (B24 + Telegram), с текстом автора и ссылкой на сообщение. Свой cooldown
   `resolved.cooldown_seconds` (900), от incident-cooldown не зависит.
   `problem_hints` («не отвечает», «не онлайн», «упал») важнее: при их наличии
   сообщение уходит как инцидент, а не как восстановление. Отключается
   `resolved.enabled: false`.
+- Цепочка инцидента (раздел `chain` в конфиге): если в сообщении о
+  восстановлении сервер не назван, он берётся из последнего открытого
+  инцидента (`logs\tg_support_chain.json`, окно `chain.window_minutes` = 720
+  мин). Несколько открытых серверов: уточнение по названному домену проекта
+  (`chain.match_by_project`, сверка с Projects), иначе берётся самый свежий, а
+  при словах «серверы/проекты онлайн» — все открытые. Сообщение закрывает
+  инцидент. Блок проектов в `✅` добавляется при `resolved.include_projects`:
+  `true`/`false`/`auto` (по умолчанию `auto` — сервер подобран из цепочки или
+  в тексте есть «проекты/сайты/магазины»). История чата недоступна: цепочка
+  опирается только на собственные отправленные уведомления.
 - `prj_active_projects.py` — проекты сервера из портала Projects
   (`http://www.projects.prj`): read-only POST `schedule.html`
   (`filter=active`, `cst_string=%`, `srv_srg_id[]=1|14|53|74|75`) + проверка
@@ -112,8 +137,10 @@
   уведомление уходит без списка.
 - Проверка вручную:
   ```powershell
+  .venv\Scripts\python.exe -m unittest discover -s tests
   .venv\Scripts\python.exe tg_support_read.py --follow
   .venv\Scripts\python.exe tg_support_alert.py --dry-run
+  .venv\Scripts\python.exe tg_support_alert.py --shadow
   .venv\Scripts\python.exe prj_active_projects.py --server p5ru3
   .venv\Scripts\python.exe sm_projects.py 4123
   ```
