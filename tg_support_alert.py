@@ -7,9 +7,10 @@ Telegram-комната 4385). Для каждого упомянутого в �
 блок «Затронутые проекты» из портала Projects (prj_active_projects): в одном
 уведомлении только те серверы, что реально названы в тексте.
 
-Сообщения без пометки автора из author_marks (по умолчанию «Сис. админ») не
-дают уведомлений; отключается --any-author. Пометка ищется в username,
-first_name, last_name автора или в начале текста, регистр и точки не важны.
+Сообщения не от «своих» авторов уведомлений не дают: подходит username из
+author_usernames либо пометка из author_marks (по умолчанию «Сис. админ») в
+username, first_name, last_name автора или в начале текста — регистр и точки не
+важны. Пустой список снимает фильтр, --any-author отключает его разово.
 
 Уведомление даёт только свежие сообщения: старше max_message_age_minutes
 (по умолчанию 60) они пропускаются как старые инциденты, --max-age меняет
@@ -26,7 +27,7 @@ first_name, last_name автора или в начале текста, реги
   --dry-run        собрать сообщения, напечатать, ничего не отправлять;
   --reset          сбросить offset перед опросом;
   --no-extended    блок проектов только по группам 1/14 (без 53/74/75);
-  --any-author     не фильтровать по пометке автора (author_marks);
+  --any-author     не фильтровать по автору (author_marks/author_usernames);
   --max-age N      порог возраста сообщения, мин (0 — без ограничения).
 """
 
@@ -189,11 +190,17 @@ def mark_key(text: str) -> str:
 
 
 def marked_author(msg: dict, text: str, cfg: dict) -> bool:
-    """Проверка пометки автора (author_marks) в имени/username или в начале текста."""
+    """Проверка автора: username из author_usernames или пометка author_marks."""
     keys = {mark_key(m) for m in cfg.get("author_marks", []) if m and m.strip()}
-    if not keys:
+    names = {str(u).lstrip("@").lower() for u in cfg.get("author_usernames", []) if u}
+    if not keys and not names:
         return True
     who = msg.get("from") or {}
+    username = (who.get("username") or "").lower()
+    if username and username in names:
+        return True
+    if not keys:
+        return False
     parts = (who.get("username"), who.get("first_name"), who.get("last_name"))
     if any(k in mark_key(p) for p in parts if p for k in keys):
         return True

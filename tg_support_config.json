@@ -50,6 +50,9 @@
   "author_marks": [
     "Сис. админ"
   ],
+  "author_usernames": [
+    "alxweb_ru"
+  ],
   "max_message_age_minutes": 60,
   "max_messages_per_run": 5,
   "cooldown_seconds": 300,
