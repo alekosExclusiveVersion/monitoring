@@ -12,9 +12,16 @@ author_usernames либо пометка из author_marks (по умолчан�
 username, first_name, last_name автора или в начале текста — регистр и точки не
 важны. Пустой список снимает фильтр, --any-author отключает его разово.
 
-Уведомление даёт только свежие сообщения: старше max_message_age_minutes
+Уведомление дает только свежие сообщения: старше max_message_age_minutes
 (по умолчанию 60) они пропускаются как старые инциденты, --max-age меняет
 порог, 0 — без ограничения.
+
+Сообщения о восстановлении (раздел resolved в конфиге: «восстановлен»,
+«снова онлайн», «заработал», «работы завершены» и т.п.) транслируются как
+✅ «онлайн» в те же каналы; отдельный cooldown resolved.cooldown_seconds,
+свой блок проектов по умолчанию не добавляется (resolved.include_projects).
+Признак проблемы важнее: если в тексте есть problem_hints («не отвечает»,
+«не онлайн»), сообщение уходит как инцидент, а не как восстановление.
 
 Состояние:
   logs/tg_support_reader_state.json — offset getUpdates (tg_support_read);
@@ -161,6 +168,20 @@ def find_hits(text: str, cfg: dict) -> list[str]:
     return hits + detect_servers(text, cfg)
 
 
+def find_resolved(text: str, cfg: dict) -> list[str]:
+    """Признаки восстановления; признак проблемы важнее признака восстановления."""
+    section = cfg.get("resolved") or {}
+    if not section.get("enabled", True):
+        return []
+    low = text.lower()
+    hits = [kw for kw in section.get("keywords", []) if kw.lower() in low]
+    if not hits:
+        return []
+    if any(hint.lower() in low for hint in section.get("problem_hints", [])):
+        return []
+    return hits
+
+
 def message_link(msg: dict) -> str:
     chat = msg.get("chat") or {}
     msg_id = msg.get("message_id")
@@ -238,6 +259,30 @@ def build_message(msg: dict, servers: list[str], extended: bool) -> str:
     return "\n".join(lines)
 
 
+def build_resolved(msg: dict, servers: list[str], extended: bool,
+                   include_projects: bool) -> str:
+    stamp = datetime.fromtimestamp(msg.get("date", 0)).strftime(FMT)
+    title = "ts-support · " + (", ".join(servers) if servers else "восстановление")
+    lines = [f"✅ {title} · {stamp} · онлайн", "",
+             f"{author_name(msg)}: {msg.get('text', '')}"]
+    if include_projects:
+        portal = prj.load_config()
+        for server in servers:
+            lines.append("")
+            try:
+                scope = portal.get("scope", "active")
+                projects = prj.sort_projects(
+                    prj.projects_for_server(server, portal, extended=extended), portal
+                )
+                lines.append(prj.format_block(server, projects, scope, portal))
+            except RuntimeError as e:
+                lines.append(f"Проекты ({server}): список недоступен — {e}")
+    link = message_link(msg)
+    if link:
+        lines += ["", f"Сообщение: {link}"]
+    return "\n".join(lines)
+
+
 def send(text: str, dry_run: bool) -> None:
     if dry_run:
         log("DRY-RUN:\n" + text)
@@ -272,8 +317,12 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
     sent = 0
     skipped: dict[str, int] = {}
     stale = 0
+    restored = 0
     limit = int(cfg.get("max_messages_per_run", 5))
     age_limit = int(cfg.get("max_message_age_minutes", 60) if max_age is None else max_age)
+    resolved_cfg = cfg.get("resolved") or {}
+    resolved_cooldown = int(resolved_cfg.get("cooldown_seconds", 900))
+    include_projects = bool(resolved_cfg.get("include_projects", False))
     for update in updates:
         kind = next((k for k in update if k != "update_id"), "")
         if kind not in {"message", "edited_message"}:
@@ -290,10 +339,11 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         if age is not None:
             stale += 1
             continue
-        if is_ignored(text, cfg):
+        back_hits = find_resolved(text, cfg)
+        if not back_hits and is_ignored(text, cfg):
             continue
-        hits = find_hits(text, cfg)
-        if not hits:
+        hits = [] if back_hits else find_hits(text, cfg)
+        if not hits and not back_hits:
             continue
         if not any_author and not marked_author(msg, text, cfg):
             name = author_name(msg)
@@ -303,27 +353,37 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         if msg_id in state["messages"]:
             continue
         servers = detect_servers(text, cfg)
+        if back_hits and not servers:
+            log(f"пропущено: восстановление без сервера: {text[:60]}")
+            continue
         signature = ",".join(servers) or "-"
-        last = state["cooldown"].get(signature)
-        cooldown = int(cfg.get("cooldown_seconds", 300))
+        prefix = "back:" if back_hits else ""
+        last = state["cooldown"].get(prefix + signature)
+        cooldown = resolved_cooldown if back_hits else int(cfg.get("cooldown_seconds", 300))
         now = datetime.now()
         if last and cooldown > 0:
             try:
                 if now - datetime.strptime(last, FMT) < timedelta(seconds=cooldown):
-                    log(f"пропущено по cooldown ({signature}): {text[:60]}")
+                    log(f"пропущено по cooldown ({prefix or 'alert:'} {signature}): {text[:60]}")
                     state["messages"][msg_id] = now.strftime(FMT)
                     continue
             except ValueError:
                 pass
-        log(f"срабатывание {signature}: {text[:120]}")
-        send(build_message(msg, servers, extended), dry_run)
+        if back_hits:
+            log(f"восстановление {signature} ({', '.join(back_hits)}): {text[:120]}")
+            send(build_resolved(msg, servers, extended, include_projects), dry_run)
+            restored += 1
+        else:
+            log(f"срабатывание {signature}: {text[:120]}")
+            send(build_message(msg, servers, extended), dry_run)
         state["messages"][msg_id] = now.strftime(FMT)
-        state["cooldown"][signature] = now.strftime(FMT)
+        state["cooldown"][prefix + signature] = now.strftime(FMT)
         sent += 1
         if sent >= limit:
             break
     if stale:
         log(f"пропущено: старше {age_limit} мин — {stale}")
+    log(f"уведомлений: {sent} (из них о восстановлении: {restored})")
     return sent, skipped
 
 
