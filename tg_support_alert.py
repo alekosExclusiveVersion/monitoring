@@ -3,8 +3,17 @@
 
 Один опрос getUpdates ботом-читателем: сообщения с ключевыми словами или именем
 сервера превращаются в уведомление через notify.notify_all (B24 chat123028 +
-Telegram-комната 4385). Для каждого упомянутого сервера добавляется блок
-«Затронутые проекты» из портала Projects (prj_active_projects).
+Telegram-комната 4385). Для каждого упомянутого в сообщении сервера добавляется
+блок «Затронутые проекты» из портала Projects (prj_active_projects): в одном
+уведомлении только те серверы, что реально названы в тексте.
+
+Сообщения без пометки автора из author_marks (по умолчанию «Сис. админ») не
+дают уведомлений; отключается --any-author. Пометка ищется в username,
+first_name, last_name автора или в начале текста, регистр и точки не важны.
+
+Уведомление даёт только свежие сообщения: старше max_message_age_minutes
+(по умолчанию 60) они пропускаются как старые инциденты, --max-age меняет
+порог, 0 — без ограничения.
 
 Состояние:
   logs/tg_support_reader_state.json — offset getUpdates (tg_support_read);
@@ -16,7 +25,9 @@ Telegram-комната 4385). Для каждого упомянутого се
   (по умолчанию)  разовый опрос и отправка;
   --dry-run        собрать сообщения, напечатать, ничего не отправлять;
   --reset          сбросить offset перед опросом;
-  --no-extended    блок проектов только по группам 1/14 (без 53/74/75).
+  --no-extended    блок проектов только по группам 1/14 (без 53/74/75);
+  --any-author     не фильтровать по пометке автора (author_marks);
+  --max-age N      порог возраста сообщения, мин (0 — без ограничения).
 """
 
 from __future__ import annotations
@@ -172,6 +183,33 @@ def author_name(msg: dict) -> str:
     )
 
 
+def mark_key(text: str) -> str:
+    """Ключ для сравнения пометок: регистр, пробелы и точки не важны."""
+    return re.sub(r"\W", "", str(text).lower(), flags=re.UNICODE)
+
+
+def marked_author(msg: dict, text: str, cfg: dict) -> bool:
+    """Проверка пометки автора (author_marks) в имени/username или в начале текста."""
+    keys = {mark_key(m) for m in cfg.get("author_marks", []) if m and m.strip()}
+    if not keys:
+        return True
+    who = msg.get("from") or {}
+    parts = (who.get("username"), who.get("first_name"), who.get("last_name"))
+    if any(k in mark_key(p) for p in parts if p for k in keys):
+        return True
+    head = mark_key(text[:80])
+    return any(k in head for k in keys)
+
+
+def too_old(msg: dict, max_age: int) -> int | None:
+    """Возраст сообщения в минутах, если он старше max_age — вернём возраст."""
+    stamp = msg.get("date")
+    if not stamp or max_age <= 0:
+        return None
+    age = (datetime.now().timestamp() - stamp) / 60
+    return int(age) if age > max_age else None
+
+
 def build_message(msg: dict, servers: list[str], extended: bool) -> str:
     portal = prj.load_config()
     stamp = datetime.fromtimestamp(msg.get("date", 0)).strftime(FMT)
@@ -222,9 +260,13 @@ def fetch_updates(token: str, offset: int, limit: int) -> tuple[list[dict], int]
 
 
 def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
-            extended: bool, dry_run: bool) -> int:
+            extended: bool, dry_run: bool, any_author: bool = False,
+            max_age: int | None = None) -> tuple[int, dict]:
     sent = 0
+    skipped: dict[str, int] = {}
+    stale = 0
     limit = int(cfg.get("max_messages_per_run", 5))
+    age_limit = int(cfg.get("max_message_age_minutes", 60) if max_age is None else max_age)
     for update in updates:
         kind = next((k for k in update if k != "update_id"), "")
         if kind not in {"message", "edited_message"}:
@@ -235,10 +277,20 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         if cfg.get("ignore_bots", True) and (msg.get("from") or {}).get("is_bot"):
             continue
         text = msg.get("text") or msg.get("caption") or ""
-        if not text or is_ignored(text, cfg):
+        if not text:
+            continue
+        age = too_old(msg, age_limit)
+        if age is not None:
+            stale += 1
+            continue
+        if is_ignored(text, cfg):
             continue
         hits = find_hits(text, cfg)
         if not hits:
+            continue
+        if not any_author and not marked_author(msg, text, cfg):
+            name = author_name(msg)
+            skipped[name] = skipped.get(name, 0) + 1
             continue
         msg_id = str(msg.get("message_id") or update["update_id"])
         if msg_id in state["messages"]:
@@ -263,7 +315,9 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         sent += 1
         if sent >= limit:
             break
-    return sent
+    if stale:
+        log(f"пропущено: старше {age_limit} мин — {stale}")
+    return sent, skipped
 
 
 def main() -> int:
@@ -272,6 +326,10 @@ def main() -> int:
     ap.add_argument("--reset", action="store_true", help="сбросить offset перед опросом")
     ap.add_argument("--no-extended", action="store_true",
                     help="только группы 1/14 в блоке проектов")
+    ap.add_argument("--any-author", action="store_true",
+                    help="не фильтровать по пометке автора (author_marks)")
+    ap.add_argument("--max-age", type=int, default=None,
+                    help="максимальный возраст сообщения, мин (0 — без ограничения)")
     ap.add_argument("--limit", type=int, default=100, help="апдейтов за опрос")
     args = ap.parse_args()
 
@@ -290,7 +348,12 @@ def main() -> int:
         updates, new_offset = fetch_updates(token, offset, args.limit)
         state = load_sent()
         prune_sent(state, int(cfg.get("dedupe_days", 7)))
-        sent = process(updates, chat_id, cfg, state, extended, args.dry_run)
+        sent, skipped = process(updates, chat_id, cfg, state, extended,
+                                args.dry_run, args.any_author, args.max_age)
+        if skipped:
+            log("пропущено без пометки автора: %d (%s)" % (
+                sum(skipped.values()),
+                ", ".join("%s×%d" % (name, count) for name, count in sorted(skipped.items()))))
         if args.dry_run:
             log("dry-run: offset и дедуп не сохранялись")
         else:

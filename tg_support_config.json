@@ -47,6 +47,10 @@
     "восстановили"
   ],
   "ignore_bots": true,
+  "author_marks": [
+    "Сис. админ"
+  ],
+  "max_message_age_minutes": 60,
   "max_messages_per_run": 5,
   "cooldown_seconds": 300,
   "dedupe_days": 7,
@@ -55,7 +59,7 @@
     "groups": [1, 14],
     "extended_groups": [53, 74, 75],
     "extended": true,
-    "scope": "live",
+    "scope": "active",
     "sm_url": "https://sm.office.tradesoft.ru",
     "sm_cache_ttl_minutes": 30,
     "max_projects_per_server": 30,

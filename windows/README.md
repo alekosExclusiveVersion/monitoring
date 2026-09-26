@@ -33,7 +33,11 @@
 - `monitoring/notify.py` — `secret_get()`: macOS Keychain / Windows Credential
   Manager / env `SEC_<UPPER_SNAKE>`. Канал `macos` включается только на darwin.
 - `monitoring/pricing_alert.py` — Grafana-секреты через `secret_get()`, CSV-фоллбэк
-  в `%TEMP%`, ALERTS_LOG через env.
+  в `%TEMP%`, ALERTS_LOG через env. Пороги числа поставщиков
+  (`min_runtime_providers`, `min_error_providers`) отсекают локальные сбои:
+  уведомление только о глобальной деградации. Каждое решение детектора
+  пишется в `logs\pricing_alert_events.jsonl` — в отличие от `alerts.log`,
+  который создаётся только при сбое доставки.
 - `monitoring/detect_pricing_degradation.py` — данные PSA через
   `common.paths.app_data_dir()` (кроссплатформенный каталог).
 - `db-clean/db-clean-aisql.py` — `--notify` шлёт события в B24/Telegram напрямую
@@ -52,6 +56,16 @@
   (B24 `chat123028` + Telegram 4385) от alert-бота `opencode.tg-alert-token`.
   Состояние: `logs\tg_support_sent.json` (дедуп по `message_id`, cooldown),
   `logs\tg_support.lock`, журнал `logs\tg_support_alert.log`.
+- Отбор сообщений (всё настраивается в `tg_support_config.json`):
+  - `author_marks` — уведомление дают только сообщения авторов с пометкой
+    (по умолчанию «Сис. админ»): ищется в `username`, `first_name`, `last_name`
+    или в начале текста, регистр и точки не важны; отключается `--any-author`;
+  - `max_message_age_minutes` (60) — сообщения старше порога пропускаются как
+    старые инциденты, в том числе накопившиеся в очереди `getUpdates` за время
+    простоя бота; `--max-age N` меняет порог, `0` — без ограничения;
+  - `max_messages_per_run` (5) и `cooldown_seconds` (300 на подпись серверов) —
+    защита от серии однотипных уведомлений.
+- В одном уведомлении только серверы, реально названные в тексте сообщения.
 - `prj_active_projects.py` — проекты сервера из портала Projects
   (`http://www.projects.prj`): read-only POST `schedule.html`
   (`filter=active`, `cst_string=%`, `srv_srg_id[]=1|14|53|74|75`) + проверка
@@ -62,22 +76,25 @@
   `logs\prj_archive_cache.json` (TTL `archive_cache_ttl_hours`, по проекту).
   Системный прокси игнорируется. Секреты: `opencode.projects.prj-login-user`,
   `opencode.projects.prj-login`.
-- `sm_projects.py` — реестр проектов из System Monitor
-  (`https://sm.office.tradesoft.ru`): `GET /api/project/<id>` без авторизации,
-  отдаёт `id`, `name`, `users` (логины Parts.Resource), `allowedIpList`;
-  кэш `logs\sm_projects_cache.json` (TTL `sm_cache_ttl_minutes`). Эндпоинт
-  `/api/project/<id>/info` не используется — он отдаёт `apiKey`/`serviceKeys`.
-- Состав блока «Затронутые проекты»: `scope=live` (по умолчанию) — неархивные
-  проекты сервера, у которых есть активная услуга групп 1/14, 53/74/75 **или**
-  пользователь в System Monitor. `users` в System Monitor — это реестр логинов,
-  а не текущие сессии, поэтому список не пустеет, когда сервер лежит.
-  `scope=active` — только активные услуги; `scope=hosted` (`--scope hosted`) —
-  все неархивные проекты сервера, включая проекты без активной услуги и без
-  пользователей, — для сверки и разбора. В списке только адрес сайта, по одному
-  в строке, без ID и названия. Не более `max_projects_per_server` строк,
-  остальные свернуты. Группы 53/74/75 учитываются по умолчанию
-  (`projects_portal.extended`), отключаются `--no-extended`. Если System Monitor
-  недоступен, блок строится по активным услугам с соответствующей пометкой.
+- `sm_projects.py` — инструмент ручной сверки, в оповещениях не участвует:
+  реестр проектов из System Monitor (`https://sm.office.tradesoft.ru`),
+  `GET /api/project/<id>` без авторизации, отдаёт `id`, `name`, `users` (логины
+  Parts.Resource), `allowedIpList`; кэш `logs\sm_projects_cache.json` (TTL
+  `sm_cache_ttl_minutes`, default 30). Эндпоинт `/api/project/<id>/info` не
+  используется — он отдаёт `apiKey`/`serviceKeys`.
+- Состав блока «Затронутые проекты»: `scope=active` (по умолчанию) — только
+  неархивные проекты с активной услугой групп 1/14, 53/74/75 (поддержка и
+  лицензия Parts.Resource, аренда Parts.Resource, синхронизатор и его поддержка).
+  Проекты без активных услуг в уведомление не попадают, даже если они есть в
+  System Monitor. В списке только адрес сайта, по одному в строке, без ID и
+  названия. Группы 53/74/75 учитываются по умолчанию
+  (`projects_portal.extended`), отключаются `--no-extended`.
+- Режимы сверки (только вручную, в уведомление не идут):
+  `--scope live` — активная услуга **или** пользователь в System Monitor;
+  `--scope hosted` — все неархивные проекты сервера, включая проекты без услуги
+  и без пользователей. Не более `max_projects_per_server` строк в блоке,
+  остальные сворачиваются. Если System Monitor недоступен, режим `live`
+  строится по активным услугам с соответствующей пометкой.
 - Сообщение = текст триггера, автор, время, блок «Затронутые проекты» на каждый
   упомянутый сервер и ссылка на исходное сообщение; при недоступности портала
   уведомление уходит без списка.
