@@ -7,10 +7,11 @@ provider_runtime_logs), сравнивает последний час с тем
 Telegram) с гиперссылками на дашборд Grafana за окно сбоя.
 
 Триггеры (пороги в pricing_alert_config.json):
-  runtime  — среднее время проценки на поставщике >= abs_sec
-             и в INCREASE_FACTOR раз больше нормы;
-  errors   — доля ответов поставщиков с кодом >=500 >= abs_pct
-             и в INCREASE_FACTOR раз больше нормы;
+  runtime  — среднее время проценки на поставщике >= runtime_abs_sec
+             и в increase_factor раз больше нормы; затронуто не менее
+             min_runtime_providers поставщиков;
+  errors   — доля ответов поставщиков с кодом >=500 >= errors_abs_pct
+             и в increase_factor раз больше нормы;
   volume   — запросов проценки упало ниже (1 - volume_drop) от нормы.
 
 Дедупликация: уведомляем при старте инцидента, затем раз в escalate_every
@@ -69,7 +70,8 @@ def _load_config() -> dict:
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
     defaults = {
         "increase_factor": 3.0,
-        "runtime_abs_sec": 10.0,
+        "runtime_abs_sec": 15.0,
+        "min_runtime_providers": 3,
         "errors_abs_pct": 5.0,
         "volume_drop": 0.7,
         "escalate_every_hours": 1.0,
@@ -276,6 +278,10 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
                 "ratio": round(float(r["avg_r"]) / float(b["avg_r"]), 1),
                 "n": int(r["n"]),
             })
+
+    min_runtime_providers = int(cfg.get("min_runtime_providers", 3))
+    if len(res["runtime"]) < min_runtime_providers:
+        res["runtime"] = []
 
     for provider, r in sorted(cur["errors"].items(), key=lambda kv: -kv[1]["e"]):
         base_n = base["errors"].get(provider, {}).get("n", 0)

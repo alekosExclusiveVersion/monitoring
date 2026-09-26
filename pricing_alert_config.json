@@ -1,6 +1,7 @@
 {
   "increase_factor": 3.0,
-  "runtime_abs_sec": 10.0,
+  "runtime_abs_sec": 15.0,
+  "min_runtime_providers": 3,
   "errors_abs_pct": 5.0,
   "volume_drop": 0.7,
   "escalate_every_hours": 1.0,
