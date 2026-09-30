@@ -21,7 +21,7 @@ Telegram) с гиперссылками на дашборд Grafana за окн�
 
 Тихий ярус (single_provider_*, по умолчанию включён): сбой ровно одного
 поставщика, не дотянувший до глобальных порогов, — отдельное уведомление не
-чаще одного   раза в single_provider_every_hours (по умолчанию 4 ч) СКВОЗЬ
+чаще одного раза в single_provider_every_hours (по умолчанию 3 ч) СКВОЗЬ
 эпизоды, общий троттлинг на все поставщики. Порог входа: доля ошибок >=
 single_provider_error_pct либо среднее время >= single_provider_runtime_sec.
 Число поставщиков, попавших в ярус, не должно превышать single_provider_max_n;
@@ -78,6 +78,24 @@ MAX_PROVIDERS_IN_MSG = 6
 MAX_SITES_IN_MSG = 8
 PHASE2 = REPO / "detect_pricing_degradation.py"
 
+# Единственный источник значений по умолчанию. pricing_alert_config.json может
+# переопределять любое из них; _load_config() добавляет отсутствующие ключи.
+CONFIG_DEFAULTS = {
+    "increase_factor": 3.0,
+    "runtime_abs_sec": 15.0,
+    "min_runtime_providers": 3,
+    "errors_abs_pct": 5.0,
+    "min_error_providers": 3,
+    "volume_drop": 0.7,
+    "escalate_every_hours": 1.0,
+    "window_seconds": WINDOW_SEC,
+    "single_provider_notify": True,
+    "single_provider_every_hours": 3.0,
+    "single_provider_error_pct": 20.0,
+    "single_provider_runtime_sec": 20.0,
+    "single_provider_max_n": 1,
+}
+
 
 def _ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -85,22 +103,7 @@ def _ts():
 
 def _load_config() -> dict:
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-    defaults = {
-        "increase_factor": 3.0,
-        "runtime_abs_sec": 15.0,
-        "min_runtime_providers": 3,
-        "errors_abs_pct": 5.0,
-        "min_error_providers": 3,
-        "volume_drop": 0.7,
-        "escalate_every_hours": 1.0,
-        "window_seconds": WINDOW_SEC,
-        "single_provider_notify": True,
-        "single_provider_every_hours": 4.0,
-        "single_provider_error_pct": 20.0,
-        "single_provider_runtime_sec": 20.0,
-        "single_provider_max_n": 1,
-    }
-    for k, v in defaults.items():
+    for k, v in CONFIG_DEFAULTS.items():
         cfg.setdefault(k, v)
     return cfg
 
@@ -111,39 +114,37 @@ def _single_defaults() -> dict:
             "single_providers": []}
 
 
+def _state_defaults() -> dict:
+    return {
+        "active": False,
+        "active_since": "",
+        "last_notify": "",
+        "alerted_hours": 0,
+        **_single_defaults(),
+    }
+
+
 def _load_state() -> dict:
-    default = {"active": False, "active_since": "", "last_notify": "",
-               "alerted_hours": 0}
+    normalized = _state_defaults()
     if STATE.exists():
         try:
             state = json.loads(STATE.read_text(encoding="utf-8"))
             if isinstance(state, dict):
-                # Ключи тихого яруса могли отсутствовать в state от прежней версии.
-                for k, v in _single_defaults().items():
-                    state.setdefault(k, v)
-                return state
+                # Сохраняем неизвестные будущие ключи, но текущие ключи всегда есть.
+                normalized.update(state)
         except (OSError, json.JSONDecodeError):
             pass
-    return {**default, **_single_defaults()}
+    return normalized
 
 
 def _save_state(state: dict) -> None:
-    # Ключи single_* переживают любую перезапись: троттлинг тихого яруса не должен
-    # сбрасываться, когда state пишется из ветки глобального инцидента.
-    existing: dict = {}
-    if STATE.exists():
-        try:
-            loaded = json.loads(STATE.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-    for k, v in _single_defaults().items():
-        if k not in state:
-            state[k] = existing.get(k, v)
+    # Пишет только переданное состояние. Вызывающий код обязан явно переносить
+    # нужные ключи через **state: здесь нет скрытого слияния с файлом на диске.
+    payload = _state_defaults()
+    payload.update(state)
     STATE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, STATE)
 
 
@@ -165,17 +166,17 @@ def _log_event(decision: str, cur: dict, base: dict, det: dict,
             "errors": len(cur.get("errors", {})),
         },
         "thresholds": {
-            "runtime_abs_sec": cfg.get("runtime_abs_sec"),
-            "min_runtime_providers": int(cfg.get("min_runtime_providers", 3)),
-            "errors_abs_pct": cfg.get("errors_abs_pct"),
-            "min_error_providers": int(cfg.get("min_error_providers", 3)),
-            "increase_factor": cfg.get("increase_factor"),
-            "volume_drop": cfg.get("volume_drop"),
-            "single_notify": cfg.get("single_provider_notify", True),
-            "single_every_hours": cfg.get("single_provider_every_hours"),
-            "single_error_pct": cfg.get("single_provider_error_pct"),
-            "single_runtime_sec": cfg.get("single_provider_runtime_sec"),
-            "single_max_n": int(cfg.get("single_provider_max_n", 1)),
+            "runtime_abs_sec": cfg["runtime_abs_sec"],
+            "min_runtime_providers": int(cfg["min_runtime_providers"]),
+            "errors_abs_pct": cfg["errors_abs_pct"],
+            "min_error_providers": int(cfg["min_error_providers"]),
+            "increase_factor": cfg["increase_factor"],
+            "volume_drop": cfg["volume_drop"],
+            "single_notify": cfg["single_provider_notify"],
+            "single_every_hours": cfg["single_provider_every_hours"],
+            "single_error_pct": cfg["single_provider_error_pct"],
+            "single_runtime_sec": cfg["single_provider_runtime_sec"],
+            "single_max_n": int(cfg["single_provider_max_n"]),
         },
         "signals": {
             "runtime": {
@@ -364,7 +365,7 @@ def _sparkline(avg_list: list) -> str:
 
 
 def _detect(cur: dict, base: dict, cfg: dict) -> dict:
-    factor = cfg.get("increase_factor", 3.0)
+    factor = cfg["increase_factor"]
     res = {"runtime": [], "errors": [], "volume": {}, "suppressed": {}}
 
     for provider, r in sorted(cur["runtime"].items(), key=lambda kv: -kv[1]["avg_r"]):
@@ -412,9 +413,9 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
     # Пороги числа поставщиков: локальный сбой одного поставщика — не инцидент.
     # Подавленные сигналы сохраняем целиком, чтобы решение было видно в журнале
     # событий, а тихий ярус мог построить текст и применить порог тяжести.
-    for key, cfg_key, default in (("runtime", "min_runtime_providers", 3),
-                                  ("errors", "min_error_providers", 3)):
-        minimum = int(cfg.get(cfg_key, default))
+    for key, cfg_key in (("runtime", "min_runtime_providers"),
+                            ("errors", "min_error_providers")):
+        minimum = int(cfg[cfg_key])
         if len(res[key]) < minimum:
             if res[key]:
                 res["suppressed"][key] = {
@@ -662,6 +663,7 @@ def _build_single_recovery_message(t_from: int, t_to: int,
         f"  • вернулся к норме: {names}",
         "",
         f"График времени: {_grafana_link(t_from, t_to, 25)}",
+        f"График ошибок:  {_grafana_link(t_from, t_to, 27)}",
     ])
 
 
@@ -671,8 +673,8 @@ def _single_hits(det: dict, cfg: dict) -> list[str]:
     Порог строже базового: поставщик уже прошёл increase_factor и абсолютный
     порог (errors_abs_pct / runtime_abs_sec), здесь добавляется свой уровень.
     """
-    err_bar = float(cfg.get("single_provider_error_pct", 20.0))
-    rt_bar = float(cfg.get("single_provider_runtime_sec", 20.0))
+    err_bar = float(cfg["single_provider_error_pct"])
+    rt_bar = float(cfg["single_provider_runtime_sec"])
     names: list[str] = []
     sup = det.get("suppressed") or {}
     for e in (sup.get("errors", {}).get("entries") or []):
@@ -697,7 +699,7 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
     что одиночных сбоев не было и сообщать не о чем.
     """
     names = _single_hits(det, cfg)
-    max_n = int(cfg.get("single_provider_max_n", 1))
+    max_n = int(cfg["single_provider_max_n"])
     if max_n > 0 and len(names) > max_n:
         # Поставщиков больше, чем допускает тихий ярус. Это не восстановление:
         # состояние открытого эпизода не трогаем, просто выходим.
@@ -722,7 +724,7 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
                 last, "%Y-%m-%d %H:%M:%S")).total_seconds()
         except ValueError:
             elapsed = None
-    every = float(cfg.get("single_provider_every_hours", 4.0))
+    every = float(cfg["single_provider_every_hours"])
     if elapsed is not None and elapsed < every * 3600:
         # Троттлинг сквозной: считаем от последнего СООБЩЕНИЯ, независимо от
         # того, был ли эпизод к этому моменту закрыт. Иначе чередование
@@ -749,7 +751,7 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
 
 def main() -> int:
     cfg = _load_config()
-    window = int(cfg.get("window_seconds", WINDOW_SEC))
+    window = int(cfg["window_seconds"])
     now = int(time.time())
     cur_from = now - window
     cur_to = now
@@ -768,13 +770,13 @@ def main() -> int:
 
     if not is_abnormal:
         single_decision, single_patch = None, {}
-        if cfg.get("single_provider_notify", True):
+        if cfg["single_provider_notify"]:
             single_decision, single_patch = _handle_single(
                 cur, base, det, cfg, cur_from, cur_to, state, now_s)
         if state.get("active"):
             body = _build_recovery_message(cur, base, cfg, cur_from, cur_to)
             _notify(body, "pricing-alert: восстановлено")
-        _save_state({"active": False, "active_since": "", "last_notify": "",
+        _save_state({**state, "active": False, "active_since": "", "last_notify": "",
                      "alerted_hours": 0, **single_patch})
         decision = "recovery" if state.get("active") else "normal"
         if single_decision:
@@ -795,7 +797,7 @@ def main() -> int:
             lines += "\n\nТаймауты проценки на БД (× к норме, таймауты/ч):\n"
             lines += "\n".join(site_lines)
         _notify(lines, "pricing-alert: проценка замедлилась")
-        _save_state({"active": True, "active_since": now_s, "last_notify": now_s,
+        _save_state({**state, "active": True, "active_since": now_s, "last_notify": now_s,
                      "alerted_hours": 0})
         _log_event("incident", cur, base, det, cfg, cur_from, cur_to)
         print(f"{_ts()} ИНЦИДЕНТ: {len(det['runtime'])} runtime, "
@@ -804,7 +806,7 @@ def main() -> int:
 
     hours = int((datetime.now() - datetime.strptime(
         state["active_since"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600)
-    escalate_every = float(cfg.get("escalate_every_hours", 1.0))
+    escalate_every = float(cfg["escalate_every_hours"])
     last = datetime.strptime(state["last_notify"], "%Y-%m-%d %H:%M:%S")
     escalated = False
     if hours >= 1 and (datetime.now() - last).total_seconds() >= escalate_every * 3600:
