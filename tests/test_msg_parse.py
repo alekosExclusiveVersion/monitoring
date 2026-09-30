@@ -53,14 +53,19 @@ class Dictionaries(unittest.TestCase):
             self.assertEqual(kind_of(text)["kind"], "incident", text)
 
     def test_morphology(self):
-        for text in ("падает", "сломалось", "висел", "перезагружаем", "ребут"):
+        for text in ("падает", "сломалось", "висел", "перезагружаем", "ребут",
+                     "p7ru1 не вышло"):
             self.assertEqual(kind_of(text)["kind"], "incident", text)
+
+    def test_multiword_stems(self):
+        self.assertEqual(
+            msg_parse.match_stems("p7ru1 не восстановлена", ["не восстанов"]),
+            ["не восстанов"])
+        self.assertEqual(kind_of("p7ru1 не восстановлена")["kind"], "incident")
 
     def test_numbers_are_exact(self):
         self.assertEqual(kind_of("код 500")["kind"], "incident")
         for text in ("код 4500", "1500 отказов", "500-ки"):
-            if text == "500-ки":
-                continue
             self.assertEqual(kind_of(text)["kind"], "shadow", text)
 
     def test_no_false_positive_words(self):
@@ -74,8 +79,31 @@ class Dictionaries(unittest.TestCase):
 
     def test_problem_beats_restore(self):
         for text in ("p7ru3 не отвечает, но p5ru3 восстановлен",
-                     "p7ru1 не восстановлен", "p7ru1 не онлайн"):
+                     "p7ru1 не восстановлен", "p7ru1 не онлайн",
+                     "p7ru1 не восстановлена"):
             self.assertEqual(kind_of(text)["kind"], "incident", text)
+
+
+class ConfigSanity(unittest.TestCase):
+    def test_no_duplicates_within_lists(self):
+        def check(path, values):
+            seen = set()
+            dups = []
+            for value in values:
+                if value in seen and value not in dups:
+                    dups.append(value)
+                seen.add(value)
+            self.assertEqual(dups, [], path)
+
+        for section in ("incident", "resolved", "planned"):
+            entries = CONFIG.get(section) or {}
+            for key in ("words", "stems", "phrases", "override",
+                        "override_words", "problem_phrases", "problem_words",
+                        "problem_stems"):
+                if key in entries:
+                    check(f"{section}.{key}", entries[key])
+        check("server_stems", CONFIG.get("server_stems", []))
+        check("ignore_exact", CONFIG.get("ignore_exact", []))
 
 
 class Rules(unittest.TestCase):

@@ -61,10 +61,27 @@ def match_words(text: str, words: Iterable[str]) -> list[str]:
     return _unique(w for w in words if normalize(w) in toks)
 
 
+def _stem_matches(stem_words: list[str], toks: list[str]) -> bool:
+    """Одно слово — префикс токена; несколько слов — все слова, кроме
+    последнего, совпадают целиком, последнее — префиксом токена."""
+    if not stem_words or not toks:
+        return False
+    if len(stem_words) == 1:
+        return any(t.startswith(stem_words[0]) for t in toks)
+    head, tail = stem_words[:-1], stem_words[-1]
+    if not tail or len(toks) < len(stem_words):
+        return False
+    for i in range(len(toks) - len(stem_words) + 1):
+        if toks[i:i + len(head)] == head and toks[i + len(head)].startswith(tail):
+            return True
+    return False
+
+
 def match_stems(text: str, stems: Iterable[str]) -> list[str]:
-    """Токен начинается с основы: «тормоз» ловит «тормозит»."""
+    """Токен начинается с основы («тормоз» ловит «тормозит»); основа из
+    нескольких слов («не восстанов») ловит «не восстановлена»."""
     toks = tokens(text)
-    return _unique(s for s in stems if any(t.startswith(normalize(s)) for t in toks))
+    return _unique(s for s in stems if _stem_matches(normalize(s).split(), toks))
 
 
 def match_phrases(text: str, phrases: Iterable[str]) -> list[str]:

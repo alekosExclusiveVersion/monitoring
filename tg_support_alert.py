@@ -20,9 +20,10 @@ username, first_name, last_name автора или в начале текста
 Цепочка инцидента (chain): отправленное уведомление-инцидент открывает сервер
 в logs/tg_support_chain.json, поэтому «восстановили» без названия сервера
 достраивается до последнего открытого сервера, а «опять лежит» — до него же.
-Восстановление закрывает цепочку. Окно chain.window_minutes (720 по умолчанию),
-при необходимости сервер уточняется названным доменом проекта
-(chain.match_by_project).
+Восстановление закрывает цепочку. Если открытого инцидента нет, восстановление
+без сервера уходит в shadow-лог, а не отправляется. Окно chain.window_minutes
+(720 по умолчанию), при необходимости сервер уточняется названным доменом
+проекта (chain.match_by_project).
 
 Восстановление (resolved) транслируется как ✅ «онлайн»; resolved.include_projects
 = auto добавляет блок проектов, если сервер подобран из цепочки или в тексте
@@ -30,7 +31,8 @@ username, first_name, last_name автора или в начале текста
 
 Всё, что не распознано, но пришло от доверенного автора, пишется в shadow-лог
 (logs/tg_support_unmatched.jsonl) — по нему словари дополняются фактическими
-формулировками; --shadow показывает последние записи.
+формулировками; --shadow показывает последние записи. В --dry-run shadow-лог
+не пишется, такие сообщения только считаются и показываются в журнале.
 
 Состояние:
   logs/tg_support_reader_state.json — offset getUpdates (tg_support_read);
@@ -124,8 +126,12 @@ def load_sent() -> dict:
         data = json.loads(SENT_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"messages": {}, "cooldown": {}}
-    data.setdefault("messages", {})
-    data.setdefault("cooldown", {})
+    if not isinstance(data, dict):
+        return {"messages": {}, "cooldown": {}}
+    if not isinstance(data.get("messages"), dict):
+        data["messages"] = {}
+    if not isinstance(data.get("cooldown"), dict):
+        data["cooldown"] = {}
     return data
 
 
@@ -155,21 +161,43 @@ def load_chain(cfg: dict) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"servers": {}}
-    data.setdefault("servers", {})
+    if not isinstance(data, dict):
+        return {"servers": {}}
+    servers = data.get("servers")
+    if not isinstance(servers, dict):
+        servers = {}
+    data["servers"] = {
+        name: entry for name, entry in servers.items()
+        if isinstance(name, str) and isinstance(entry, dict)
+    }
     return data
+
+
+def _expired(stamp: object, cutoff: datetime) -> bool:
+    try:
+        return datetime.strptime(stamp, FMT) < cutoff
+    except (TypeError, ValueError):
+        return True
 
 
 def save_chain(chain: dict, cfg: dict) -> None:
     path = BASE_DIR / (cfg.get("chain") or {}).get("file", "logs/tg_support_chain.json")
     window = int((cfg.get("chain") or {}).get("window_minutes", 720))
     cutoff = datetime.now() - timedelta(minutes=window)
-    for server, entry in list(chain["servers"].items()):
-        if entry.get("closed"):
-            try:
-                if datetime.strptime(entry["closed"], FMT) < cutoff:
-                    chain["servers"].pop(server, None)
-            except (KeyError, ValueError):
-                chain["servers"].pop(server, None)
+    servers = chain.get("servers")
+    if not isinstance(servers, dict):
+        servers = {}
+        chain["servers"] = servers
+    for server, entry in list(servers.items()):
+        if not isinstance(entry, dict):
+            servers.pop(server, None)
+            continue
+        closed = entry.get("closed")
+        if closed:
+            if _expired(closed, cutoff):
+                servers.pop(server, None)
+        elif _expired(entry.get("since"), cutoff):
+            servers.pop(server, None)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(chain, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -323,21 +351,23 @@ def too_old(msg: dict, max_age: int) -> int | None:
     return int(age) if age > max_age else None
 
 
-def build_message(msg: dict, servers: list[str], extended: bool) -> str:
-    portal = prj.load_config()
+def projects_block(server: str, portal: dict, extended: bool, fallback: str) -> str:
+    try:
+        projects = prj.sort_projects(
+            prj.projects_for_server(server, portal, extended=extended), portal
+        )
+    except RuntimeError as e:
+        return f"{fallback} ({server}): список недоступен — {e}"
+    return prj.format_block(server, projects, portal.get("scope", "active"), portal)
+
+
+def build_message(msg: dict, servers: list[str], extended: bool, portal: dict) -> str:
     stamp = datetime.fromtimestamp(msg.get("date", 0)).strftime(FMT)
     title = "ts-support · " + (", ".join(servers) if servers else "инцидент")
     lines = [f"⚠️ {title} · {stamp}", "", f"{author_name(msg)}: {msg.get('text', '')}"]
     for server in servers:
         lines.append("")
-        try:
-            scope = portal.get("scope", "active")
-            projects = prj.sort_projects(
-                prj.projects_for_server(server, portal, extended=extended), portal
-            )
-            lines.append(prj.format_block(server, projects, scope, portal))
-        except RuntimeError as e:
-            lines.append(f"Затронутые проекты ({server}): список недоступен — {e}")
+        lines.append(projects_block(server, portal, extended, "Затронутые проекты"))
     link = message_link(msg)
     if link:
         lines += ["", f"Сообщение: {link}"]
@@ -345,23 +375,15 @@ def build_message(msg: dict, servers: list[str], extended: bool) -> str:
 
 
 def build_resolved(msg: dict, servers: list[str], extended: bool,
-                   include_projects: bool) -> str:
+                   include_projects: bool, portal: dict) -> str:
     stamp = datetime.fromtimestamp(msg.get("date", 0)).strftime(FMT)
     title = "ts-support · " + (", ".join(servers) if servers else "восстановление")
     lines = [f"✅ {title} · {stamp} · онлайн", "",
              f"{author_name(msg)}: {msg.get('text', '')}"]
     if include_projects:
-        portal = prj.load_config()
         for server in servers:
             lines.append("")
-            try:
-                scope = portal.get("scope", "active")
-                projects = prj.sort_projects(
-                    prj.projects_for_server(server, portal, extended=extended), portal
-                )
-                lines.append(prj.format_block(server, projects, scope, portal))
-            except RuntimeError as e:
-                lines.append(f"Проекты ({server}): список недоступен — {e}")
+            lines.append(projects_block(server, portal, extended, "Проекты"))
     link = message_link(msg)
     if link:
         lines += ["", f"Сообщение: {link}"]
@@ -480,17 +502,24 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
                     inferred = True
                     if kind_out == "restore_noserver":
                         kind_out = "restore"
+        if kind_out == "restore_noserver" and not servers:
+            verdict = {"kind": "shadow", "hits": verdict["hits"],
+                       "servers": [], "reason": "restore_noserver"}
+            kind_out = "shadow"
         if kind_out == "shadow":
-            shadow_log({
-                "ts": datetime.now().strftime(FMT),
-                "author": author_name(msg),
-                "username": (msg.get("from") or {}).get("username"),
-                "text": text[:500],
-                "servers": servers,
-                "reason": verdict["reason"],
-                "hits": verdict["hits"][:10],
-                "link": message_link(msg),
-            }, cfg)
+            if dry_run:
+                log(f"DRY-RUN shadow ({verdict['reason']}): {text[:120]}")
+            else:
+                shadow_log({
+                    "ts": datetime.now().strftime(FMT),
+                    "author": author_name(msg),
+                    "username": (msg.get("from") or {}).get("username"),
+                    "text": text[:500],
+                    "servers": servers,
+                    "reason": verdict["reason"],
+                    "hits": verdict["hits"][:10],
+                    "link": message_link(msg),
+                }, cfg)
             shadow += 1
             continue
         signature = ",".join(servers) or "-"
@@ -510,7 +539,7 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         if kind_out == "restore":
             log(f"восстановление {signature} ({', '.join(verdict['hits'])}): {text[:120]}")
             send(build_resolved(msg, servers, extended,
-                                want_projects(text, cfg, inferred)), dry_run)
+                                want_projects(text, cfg, inferred), portal), dry_run)
             for server in servers:
                 if server in chain.get("servers", {}):
                     chain["servers"][server]["closed"] = now.strftime(FMT)
@@ -518,7 +547,7 @@ def process(updates: list[dict], chat_id: int, cfg: dict, state: dict,
         else:
             tag = " (сервер из цепочки)" if inferred else ""
             log(f"срабатывание {signature}{tag}: {text[:120]}")
-            send(build_message(msg, servers, extended), dry_run)
+            send(build_message(msg, servers, extended, portal), dry_run)
             for server in servers:
                 entry = chain.setdefault("servers", {}).setdefault(server, {})
                 entry["since"] = now.strftime(FMT)
@@ -578,7 +607,7 @@ def main() -> int:
                 sum(skipped.values()),
                 ", ".join("%s×%d" % (name, count) for name, count in sorted(skipped.items()))))
         if args.dry_run:
-            log("dry-run: offset, дедуп и цепочка не сохранялись")
+            log("dry-run: offset, дедуп, цепочка и shadow-лог не сохранялись")
         else:
             save_offset(new_offset)
             save_sent(state)
