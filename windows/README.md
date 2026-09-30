@@ -40,7 +40,7 @@
   который создаётся только при сбое доставки.
   Тихий ярус (`single_provider_*` в `pricing_alert_config.json`) добавляет
   уведомления о сбое ровно одного поставщика: не чаще одного раза в
-  `single_provider_every_hours` (3 ч) сквозь эпизоды, общий троттлинг на все
+  `single_provider_every_hours` (4 ч) сквозь эпизоды, общий троттлинг на все
   поставщики, вход по порогу `single_provider_error_pct` (20 %) или
   `single_provider_runtime_sec` (20 с), одно сообщение о восстановлении на
   эпизод, выключатель — `single_provider_notify: false`. Превышение

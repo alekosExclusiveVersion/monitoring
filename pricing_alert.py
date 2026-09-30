@@ -21,7 +21,7 @@ Telegram) с гиперссылками на дашборд Grafana за окн�
 
 Тихий ярус (single_provider_*, по умолчанию включён): сбой ровно одного
 поставщика, не дотянувший до глобальных порогов, — отдельное уведомление не
-чаще одного раза в single_provider_every_hours (по умолчанию 3 ч) СКВОЗЬ
+чаще одного   раза в single_provider_every_hours (по умолчанию 4 ч) СКВОЗЬ
 эпизоды, общий троттлинг на все поставщики. Порог входа: доля ошибок >=
 single_provider_error_pct либо среднее время >= single_provider_runtime_sec.
 Число поставщиков, попавших в ярус, не должно превышать single_provider_max_n;
@@ -95,7 +95,7 @@ def _load_config() -> dict:
         "escalate_every_hours": 1.0,
         "window_seconds": WINDOW_SEC,
         "single_provider_notify": True,
-        "single_provider_every_hours": 3.0,
+        "single_provider_every_hours": 4.0,
         "single_provider_error_pct": 20.0,
         "single_provider_runtime_sec": 20.0,
         "single_provider_max_n": 1,
@@ -722,7 +722,7 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
                 last, "%Y-%m-%d %H:%M:%S")).total_seconds()
         except ValueError:
             elapsed = None
-    every = float(cfg.get("single_provider_every_hours", 3.0))
+    every = float(cfg.get("single_provider_every_hours", 4.0))
     if elapsed is not None and elapsed < every * 3600:
         # Троттлинг сквозной: считаем от последнего СООБЩЕНИЯ, независимо от
         # того, был ли эпизод к этому моменту закрыт. Иначе чередование
