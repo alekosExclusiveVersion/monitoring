@@ -3,7 +3,7 @@
 # Задачи:
 #   tradesoft-pricing-alert     каждые 15 минут  — pricing_alert.py (мониторинг проценки)
 #   tradesoft-tg-support-reader ежечасно          — tg_support_alert.py (оповещения ts-support)
-#   tradesoft-db-clean          ежедневно 21:00  — db-clean-aisql.py --commit --notify
+#   tradesoft-db-clean          ежедневно 21:00  — db_clean.py --commit --notify
 #
 # Все задачи выполняются через pythonw.exe (GUI-подсистема) — окна консоли не
 # появляются и не мешают работе за рабочим столом.
@@ -13,7 +13,7 @@
 #
 # Зависимости репозиториев на Windows (по умолчанию):
 #   %USERPROFILE%\Work\scripts\monitoring   — этот пакет + notify/pricing
-#   %USERPROFILE%\Work\scripts\db-clean     — db-clean-aisql.py
+#   %USERPROFILE%\Work\scripts\db-clean     — db_clean.py
 #   %USERPROFILE%\Work\ts-b24               — b24_client + .env (B24 webhook)
 #
 # Env-переменные (нужные скриптам) задаются УРОВНЕМ ПОЛЬЗОВАТЕЛЯ через
@@ -72,7 +72,7 @@ $trigDaily = New-ScheduledTaskTrigger -Daily -At "21:00"
 
 New-Task "tradesoft-pricing-alert" "`"$MonitoringRepo\pricing_alert.py`"" $trigAlert
 New-Task "tradesoft-tg-support-reader" "`"$MonitoringRepo\tg_support_alert.py`"" $trigHourly
-New-Task "tradesoft-db-clean" "`"$DbCleanRepo\db-clean-aisql.py`" --commit --notify" $trigDaily
+New-Task "tradesoft-db-clean" "`"$DbCleanRepo\db_clean.py`" --commit --notify" $trigDaily
 
 $retryTaskName = "tradesoft-db-clean-retry"
 $retryTask = Get-ScheduledTask -TaskName $retryTaskName -ErrorAction SilentlyContinue

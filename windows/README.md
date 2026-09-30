@@ -21,7 +21,7 @@
   |---|---|---|
   | `tradesoft-pricing-alert` | каждые 15 мин | `pricing_alert.py` |
   | `tradesoft-tg-support-reader` | ежечасно | `tg_support_alert.py` |
-  | `tradesoft-db-clean` | ежедневно 21:00 | `db-clean-aisql.py --commit --notify` |
+  | `tradesoft-db-clean` | ежедневно 21:00 | `db_clean.py --commit --notify` |
 
 - **БД-доступ** — данные приложения PSA лежат в
   `%APPDATA%\Parallels SQL Admin\` (servers.json + servers.key). Ключ — Fernet
@@ -47,7 +47,7 @@
   `single_provider_max_n` считается выходом за рамки яруса, а не восстановлением.
 - `monitoring/detect_pricing_degradation.py` — данные PSA через
   `common.paths.app_data_dir()` (кроссплатформенный каталог).
-- `db-clean/db-clean-aisql.py` — `--notify` шлёт события в B24/Telegram напрямую
+- `db-clean/db_clean.py` — `--notify` шлёт события в B24/Telegram напрямую
   (без macOS-агента corp-notify.sh); на Windows `DB_CLEAN_NOTIFY_ON_DELETE=1`
   ограничивает уведомления фактическим удалением БД; RETRY-маркер под env;
   B24-секреты — из Credential Manager, если нет `.env`.
@@ -212,8 +212,8 @@
 6. **Тест-прогон** на Windows:
    ```powershell
    .venv\Scripts\python.exe monitoring\pricing_alert.py   # окно/норма
-   .venv\Scripts\python.exe db-clean\db-clean-aisql.py --dry-run
-   .venv\Scripts\python.exe db-clean\db-clean-aisql.py --dry-run --notify
+   .venv\Scripts\python.exe db-clean\db_clean.py --dry-run
+   .venv\Scripts\python.exe db-clean\db_clean.py --dry-run --notify
    ```
 
 7. **Переключение**: после стабильной работы на Windows остановить демоны
@@ -236,7 +236,7 @@
   дублируются с Windows;
 - до запуска задач на Windows существует временное окно без боевого мониторинга
   (кроме VPN-баннеров corp-notify);
-- `pricing_alert.py`/`db-clean-aisql.py` остаются в репозитории как
+- `pricing_alert.py`/`db_clean.py` остаются в репозитории как
   кроссплатформенный код — на Windows они нужны, на macOS их демоны отключены;
 - VPN-маршруты/баннеры (`routes-dead.*`, `vpn.*`) по-прежнему на macOS.
 

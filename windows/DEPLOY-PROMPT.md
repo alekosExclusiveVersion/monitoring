@@ -69,7 +69,7 @@ Tradesoft: (1) сторож веб-проценки (pricing-alert) и (2) ав�
 
 6. КОНТРОЛЬНЫЙ ПРОГОН (не слать уведомления):
    a) db-clean dry-run (без --notify, чтобы не слать в чаты):
-        %USERPROFILE%\Work\scripts\monitoring\.venv\Scripts\python.exe %USERPROFILE%\Work\scripts\db-clean\db-clean-aisql.py --dry-run
+        %USERPROFILE%\Work\scripts\monitoring\.venv\Scripts\python.exe %USERPROFILE%\Work\scripts\db-clean\db_clean.py --dry-run
       Ожидание: строка SUMMARY candidates=... to_drop=... skipped=...
    b) pricing-alert в «нормальном» режиме — запусти один раз и убедись, что
       нет traceback и окно запроса посчитанo (первый запуск может занять
