@@ -19,6 +19,17 @@ Telegram) с гиперссылками на дашборд Grafana за окн�
 локальные сбои отдельных поставщиков: уведомление только о глобальной деградации.
 Каждое решение детектора пишется в logs/pricing_alert_events.jsonl.
 
+Тихий ярус (single_provider_*, по умолчанию включён): сбой ровно одного
+поставщика, не дотянувший до глобальных порогов, — отдельное уведомление не
+чаще одного раза в single_provider_every_hours (по умолчанию 3 ч) СКВОЗЬ
+эпизоды, общий троттлинг на все поставщики. Порог входа: доля ошибок >=
+single_provider_error_pct либо среднее время >= single_provider_runtime_sec.
+Число поставщиков, попавших в ярус, не должно превышать single_provider_max_n;
+при превышении ярус не срабатывает вовсе (это не восстановление).
+О восстановлении приходит одно сообщение на эпизод. Выключается ключом
+single_provider_notify: false. Решения в журнале: single_provider,
+single_provider_silent, single_provider_recovery.
+
 Дедупликация: уведомляем при старте инцидента, затем раз в escalate_every
 часов («продолжается N ч»), при восстановлении — «всё нормально».
 
@@ -83,23 +94,53 @@ def _load_config() -> dict:
         "volume_drop": 0.7,
         "escalate_every_hours": 1.0,
         "window_seconds": WINDOW_SEC,
+        "single_provider_notify": True,
+        "single_provider_every_hours": 3.0,
+        "single_provider_error_pct": 20.0,
+        "single_provider_runtime_sec": 20.0,
+        "single_provider_max_n": 1,
     }
     for k, v in defaults.items():
         cfg.setdefault(k, v)
     return cfg
 
 
+def _single_defaults() -> dict:
+    """Состояние тихого яруса: одиночные сбои ниже порога числа поставщиков."""
+    return {"single_active": False, "single_since": "", "single_last_notify": "",
+            "single_providers": []}
+
+
 def _load_state() -> dict:
-    default = {"active": False, "active_since": "", "last_notify": "", "alerted_hours": 0}
+    default = {"active": False, "active_since": "", "last_notify": "",
+               "alerted_hours": 0}
     if STATE.exists():
         try:
-            return json.loads(STATE.read_text(encoding="utf-8"))
+            state = json.loads(STATE.read_text(encoding="utf-8"))
+            if isinstance(state, dict):
+                # Ключи тихого яруса могли отсутствовать в state от прежней версии.
+                for k, v in _single_defaults().items():
+                    state.setdefault(k, v)
+                return state
         except (OSError, json.JSONDecodeError):
             pass
-    return default
+    return {**default, **_single_defaults()}
 
 
 def _save_state(state: dict) -> None:
+    # Ключи single_* переживают любую перезапись: троттлинг тихого яруса не должен
+    # сбрасываться, когда state пишется из ветки глобального инцидента.
+    existing: dict = {}
+    if STATE.exists():
+        try:
+            loaded = json.loads(STATE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    for k, v in _single_defaults().items():
+        if k not in state:
+            state[k] = existing.get(k, v)
     STATE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -130,6 +171,11 @@ def _log_event(decision: str, cur: dict, base: dict, det: dict,
             "min_error_providers": int(cfg.get("min_error_providers", 3)),
             "increase_factor": cfg.get("increase_factor"),
             "volume_drop": cfg.get("volume_drop"),
+            "single_notify": cfg.get("single_provider_notify", True),
+            "single_every_hours": cfg.get("single_provider_every_hours"),
+            "single_error_pct": cfg.get("single_provider_error_pct"),
+            "single_runtime_sec": cfg.get("single_provider_runtime_sec"),
+            "single_max_n": int(cfg.get("single_provider_max_n", 1)),
         },
         "signals": {
             "runtime": {
@@ -364,7 +410,8 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
             }
 
     # Пороги числа поставщиков: локальный сбой одного поставщика — не инцидент.
-    # Подавленные сигналы сохраняем, чтобы решение было видно в журнале событий.
+    # Подавленные сигналы сохраняем целиком, чтобы решение было видно в журнале
+    # событий, а тихий ярус мог построить текст и применить порог тяжести.
     for key, cfg_key, default in (("runtime", "min_runtime_providers", 3),
                                   ("errors", "min_error_providers", 3)):
         minimum = int(cfg.get(cfg_key, default))
@@ -374,6 +421,7 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
                     "n": len(res[key]),
                     "min": minimum,
                     "providers": [r["provider"] for r in res[key]],
+                    "entries": [dict(r) for r in res[key]],
                 }
             res[key] = []
     return res
@@ -566,6 +614,139 @@ def _build_recovery_message(cur: dict, base: dict, cfg: dict,
     return "\n".join(lines)
 
 
+def _build_single_message(det: dict, cfg: dict, t_from: int, t_to: int,
+                          providers: list[str], eligible: int,
+                          headline: str | None = None) -> str:
+    """Сообщение тихого яруса: один поставщик деградировал, глобальной деградации нет.
+
+    Заголовок намеренно не похож на глобальный «Веб-проценка замедлилась»,
+    иначе получатель не отличит локальный сбой от инцидента.
+    """
+    if headline is None:
+        if len(providers) == 1:
+            subject = "Отдельный поставщик деградировал"
+        else:
+            subject = "Поставщики деградировали"
+        headline = (f"\U000026a0\ufe0f {subject} · "
+                    f"{_timepoint(t_from)}–{_timepoint(t_to)}")
+    lines = [headline]
+    sup = det.get("suppressed") or {}
+
+    for e in (sup.get("errors", {}).get("entries") or []):
+        if e["provider"] not in providers:
+            continue
+        lines.append(f"  • {e['provider']}: {e['pct']}% ошибочных "
+                     f"(норма {e['base_pct']}%)")
+    for r in (sup.get("runtime", {}).get("entries") or []):
+        if r["provider"] not in providers:
+            continue
+        lines.append(f"  • {r['provider']}: {r['cur']} с (норма {r['base']} с, "
+                     f"p95 {r['p95']} с, ×{r['ratio']})")
+
+    lines.append("")
+    lines.append(f"Не глобальная деградация: {len(providers)} из {_fmt_int(eligible)} "
+                 f"поставщиков на грани. Проверьте вручную.")
+    lines.append("")
+    lines.append(f"График времени: {_grafana_link(t_from, t_to, 25)}")
+    lines.append(f"График ошибок:  {_grafana_link(t_from, t_to, 27)}")
+    return "\n".join(lines)
+
+
+def _build_single_recovery_message(t_from: int, t_to: int,
+                                   providers: list[str]) -> str:
+    names = ", ".join(providers) if providers else "—"
+    return "\n".join([
+        f"\U00002705 Отдельный поставщик восстановлен · "
+        f"{_timepoint(t_from)}–{_timepoint(t_to)}",
+        "",
+        f"  • вернулся к норме: {names}",
+        "",
+        f"График времени: {_grafana_link(t_from, t_to, 25)}",
+    ])
+
+
+def _single_hits(det: dict, cfg: dict) -> list[str]:
+    """Имена поставщиков, прошедших порог тяжести для тихого яруса.
+
+    Порог строже базового: поставщик уже прошёл increase_factor и абсолютный
+    порог (errors_abs_pct / runtime_abs_sec), здесь добавляется свой уровень.
+    """
+    err_bar = float(cfg.get("single_provider_error_pct", 20.0))
+    rt_bar = float(cfg.get("single_provider_runtime_sec", 20.0))
+    names: list[str] = []
+    sup = det.get("suppressed") or {}
+    for e in (sup.get("errors", {}).get("entries") or []):
+        if float(e.get("pct") or 0) >= err_bar and e["provider"] not in names:
+            names.append(e["provider"])
+    for r in (sup.get("runtime", {}).get("entries") or []):
+        if float(r.get("cur") or 0) >= rt_bar and r["provider"] not in names:
+            names.append(r["provider"])
+    return names
+
+
+def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
+                   t_from: int, t_to: int, state: dict,
+                   now_s: str) -> tuple[str | None, dict]:
+    """Тихий ярус: сбои ниже порога числа поставщиков (по умолчанию один).
+
+    Троттлинг общий на все одиночные сбои: молчим single_provider_every_hours
+    с последнего сообщения, затем присылаем одно накопленное. Восстановление
+    присылаем ровно один раз на эпизод.
+
+    Возвращает (решение для журнала, патч состояния). Пустое решение означает,
+    что одиночных сбоев не было и сообщать не о чем.
+    """
+    names = _single_hits(det, cfg)
+    max_n = int(cfg.get("single_provider_max_n", 1))
+    if max_n > 0 and len(names) > max_n:
+        # Поставщиков больше, чем допускает тихий ярус. Это не восстановление:
+        # состояние открытого эпизода не трогаем, просто выходим.
+        return None, {}
+    if not names:
+        if state.get("single_active"):
+            _notify(_build_single_recovery_message(
+                t_from, t_to, state.get("single_providers") or []),
+                "pricing-alert: поставщик восстановлен")
+            print(f"{_ts()} одиночный сбой закрыт: "
+                  f"{', '.join(state.get('single_providers') or []) or '-'}")
+            return "single_provider_recovery", {
+                "single_active": False, "single_since": "",
+                "single_providers": []}
+        return None, {}
+
+    last = state.get("single_last_notify") or ""
+    elapsed = None
+    if last:
+        try:
+            elapsed = (datetime.now() - datetime.strptime(
+                last, "%Y-%m-%d %H:%M:%S")).total_seconds()
+        except ValueError:
+            elapsed = None
+    every = float(cfg.get("single_provider_every_hours", 3.0))
+    if elapsed is not None and elapsed < every * 3600:
+        # Троттлинг сквозной: считаем от последнего СООБЩЕНИЯ, независимо от
+        # того, был ли эпизод к этому моменту закрыт. Иначе чередование
+        # «упал → восстановился» даёт уведомление в каждом коротком эпизоде.
+        print(f"{_ts()} одиночный сбой, тишина: {', '.join(names)}")
+        return "single_provider_silent", {}
+
+    eligible = max(len(cur.get("errors") or {}), len(cur.get("runtime") or {}))
+    headline = None
+    if state.get("single_active"):
+        hours = int(elapsed // 3600) if elapsed is not None else 0
+        headline = (f"\U000026a0\ufe0f Отдельный поставщик деградирует уже {hours} ч · "
+                    f"{_timepoint(t_from)}–{_timepoint(t_to)}")
+    _notify(_build_single_message(det, cfg, t_from, t_to, names, eligible, headline),
+            "pricing-alert: поставщик деградировал")
+    print(f"{_ts()} ОДИНОЧНЫЙ СБОЙ: {', '.join(names)}")
+    return "single_provider", {
+        "single_active": True,
+        "single_since": state.get("single_since") or now_s,
+        "single_last_notify": now_s,
+        "single_providers": names,
+    }
+
+
 def main() -> int:
     cfg = _load_config()
     window = int(cfg.get("window_seconds", WINDOW_SEC))
@@ -586,13 +767,20 @@ def main() -> int:
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if not is_abnormal:
+        single_decision, single_patch = None, {}
+        if cfg.get("single_provider_notify", True):
+            single_decision, single_patch = _handle_single(
+                cur, base, det, cfg, cur_from, cur_to, state, now_s)
         if state.get("active"):
             body = _build_recovery_message(cur, base, cfg, cur_from, cur_to)
             _notify(body, "pricing-alert: восстановлено")
         _save_state({"active": False, "active_since": "", "last_notify": "",
-                     "alerted_hours": 0})
-        _log_event("recovery" if state.get("active") else "normal",
-                   cur, base, det, cfg, cur_from, cur_to)
+                     "alerted_hours": 0, **single_patch})
+        decision = "recovery" if state.get("active") else "normal"
+        if single_decision:
+            decision = (single_decision if decision == "normal"
+                        else f"{decision}+{single_decision}")
+        _log_event(decision, cur, base, det, cfg, cur_from, cur_to)
         print(f"{_ts()} норма")
         return 0
 

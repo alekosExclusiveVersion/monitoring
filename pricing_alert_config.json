@@ -6,5 +6,10 @@
   "min_error_providers": 3,
   "volume_drop": 0.7,
   "escalate_every_hours": 1.0,
-  "window_seconds": 3600
+  "window_seconds": 3600,
+  "single_provider_notify": true,
+  "single_provider_every_hours": 3.0,
+  "single_provider_error_pct": 20.0,
+  "single_provider_runtime_sec": 20.0,
+  "single_provider_max_n": 1
 }
