@@ -75,6 +75,22 @@ class PricingAlertTestCase(unittest.TestCase):
         notify.start()
         self.addCleanup(notify.stop)
 
+    def run_main_hourly(self, cur, base, cfg, watchdog_n=1000):
+        """Без сброса метки: второй прогон в том же часе идёт в watchdog."""
+        with (
+            mock.patch.object(pa, "_window_cur", return_value=cur) as wcur,
+            mock.patch.object(pa, "_base_for", return_value=base),
+            mock.patch.object(pa, "_watchdog_counts",
+                              return_value={"n": watchdog_n, "avg_t": 1.0}),
+            mock.patch.object(pa, "_refresh_registry_if_due",
+                              side_effect=lambda reg, cfg, now_s: reg),
+            mock.patch.object(pa, "_load_config", return_value=cfg),
+            mock.patch.object(pa, "_runs_phase2", return_value=([], 0.0)),
+            mock.patch.object(pa, "_attach_trends", return_value=None),
+        ):
+            rc = pa.main()
+            return rc, wcur.call_count
+
 
 class ConfigDefaults(PricingAlertTestCase):
     def test_empty_config_file_receives_every_default(self):
@@ -372,11 +388,25 @@ class SingleEventLog(PricingAlertTestCase):
 class SingleMain(PricingAlertTestCase):
     def run_main(self, cur, base, cfg):
         with (
-            mock.patch.object(pa, "_window", side_effect=[cur, base]),
+            mock.patch.object(pa, "_window_cur", return_value=cur),
+            mock.patch.object(pa, "_window", return_value=cur),
+            mock.patch.object(pa, "_base_for", return_value=base),
+            mock.patch.object(pa, "_watchdog_counts",
+                              return_value={"n": 1000, "avg_t": 1.0}),
+            mock.patch.object(pa, "_refresh_registry_if_due",
+                              side_effect=lambda reg, cfg, now_s: reg),
             mock.patch.object(pa, "_load_config", return_value=cfg),
             mock.patch.object(pa, "_runs_phase2", return_value=([], 0.0)),
             mock.patch.object(pa, "_attach_trends", return_value=None),
         ):
+            # Каждый прогон — как новый час: сбрасываем метку дедупа,
+            # чтобы идти полным разбором (гибрид тестируется отдельно).
+            try:
+                st = json.loads(pa.STATE.read_text(encoding="utf-8"))
+                st["last_full_hour"] = ""
+                pa.STATE.write_text(json.dumps(st), encoding="utf-8")
+            except (OSError, json.JSONDecodeError):
+                pass
             return pa.main()
 
     def test_single_failure_recovery_and_throttle(self):
@@ -490,6 +520,61 @@ class SingleMain(PricingAlertTestCase):
         self.assertEqual(self.run_main(cur, base, cfg), 0)
         self.assertEqual(read_decisions()[-1], "normal")
         self.assertEqual(self.sent, [])
+
+
+class HybridSchedule(PricingAlertTestCase):
+    def test_second_run_same_hour_is_watchdog(self):
+        cfg = full_config()
+        clean = make_window()
+        rc, calls = self.run_main_hourly(clean, clean, cfg)
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_decisions()[-1], "normal")
+        self.assertEqual(calls, 1)
+
+        rc, calls = self.run_main_hourly(clean, clean, cfg)
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_decisions()[-1], "watchdog_ok")
+        self.assertEqual(calls, 0)  # тяжёлых запросов нет
+        self.assertEqual(self.sent, [])
+
+    def test_watchdog_collapse_triggers_early_analysis(self):
+        cfg = full_config()
+        # Снапшот вчерашнего часа с объёмом 4000 → ожидаемые 1000 за 15 мин.
+        h = pa._snapshot_label(__import__("time").time() - 86400)
+        (pa.STATE.parent / "hourly").mkdir(parents=True, exist_ok=True)
+        (pa.STATE.parent / "hourly" / f"{h}.json").write_text(
+            json.dumps({"runtime": {}, "errors": {},
+                        "volume": {"n": 4000}}), encoding="utf-8")
+        cur = make_window(errors={"akparts": make_error(770)})
+        base = make_window(errors={"akparts": make_error(244)})
+        # Первый прогон — полный часовой (метка пуста), даст single_provider.
+        rc, _ = self.run_main_hourly(cur, base, cfg)
+        self.assertEqual(read_decisions()[-1], "single_provider")
+        # Второй прогон в том же часе: watchdog видит 10 << 0.3*1000 → разбор.
+        rc, calls = self.run_main_hourly(cur, base, cfg, watchdog_n=10)
+        self.assertEqual(calls, 1)
+        self.assertIn(read_decisions()[-1],
+                      ("single_provider", "single_provider_silent"))
+
+    def test_watchdog_fires_only_on_real_collapse(self):
+        cfg = full_config()
+        self.assertFalse(pa._watchdog_fires({"n": 10}, 200, cfg))  # ночь: порог
+        self.assertFalse(pa._watchdog_fires({"n": 900}, 4000, cfg))  # норма
+        self.assertTrue(pa._watchdog_fires({"n": 10}, 4000, cfg))  # обвал
+        self.assertFalse(pa._watchdog_fires({}, 4000, cfg))
+
+    def test_hour_label_and_volume_and_core(self):
+        ts = __import__("time").time()
+        label = pa._hour_label(int(ts))
+        self.assertRegex(label, r"^\d{4}-\d{2}-\d{2} \d{2}:00$")
+        vol = pa._volume_from_matrix({"a": {"n": 100}, "b": {"n": 50}})
+        self.assertEqual(vol["n"], 150)
+        reg = {"hours_total": 10, "providers": {
+            "core1": {"hours_seen": 10}, "core2": {"hours_seen": 9},
+            "tail": {"hours_seen": 1}}}
+        self.assertEqual(pa._registry_core(reg), ["core1", "core2"])
+        self.assertEqual(pa._registry_core({"hours_total": 0,
+                                            "providers": {}}), [])
 
 
 if __name__ == "__main__":

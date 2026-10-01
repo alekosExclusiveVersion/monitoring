@@ -15,6 +15,17 @@ Telegram) с гиперссылками на дашборд Grafana за окн�
              min_error_providers поставщиков;
   volume   — запросов проценки упало ниже (1 - volume_drop) от нормы.
 
+График (гибрид, нагрузка на ClickHouse снижена ~5×):
+  каждые 15 мин — лёгкий watchdog (1 запрос без GROUP BY/квантилей);
+  полный разбор провайдеров — 1 раз в завершённый ровный час, base-окно
+  из файлового кэша (вчерашний cur), дедуп по метке часа в state.
+  При обвале объёма watchdog запускает досрочный скользящий разбор.
+  Открытый инцидент разбирается каждые 15 мин (свежесть эскалации).
+
+Реестр providers_registry.json: ядро (>90% часов) — стабильный знаменатель
+«N из M» вместо плавающего max(); refresh ночью (2 лёгких запроса за 24ч),
+сид из providers_active.csv. Каждый запрос ClickHouse замеряется (q_ms).
+
 Пороги числа поставщиков (min_runtime_providers, min_error_providers) отсекают
 локальные сбои отдельных поставщиков: уведомление только о глобальной деградации.
 Каждое решение детектора пишется в logs/pricing_alert_events.jsonl.
@@ -76,7 +87,15 @@ SHIFT_SEC = 86400
 MIN_PROVIDER_N = 50
 MAX_PROVIDERS_IN_MSG = 6
 MAX_SITES_IN_MSG = 8
+TREND_MAX_PROVIDERS = 3
+WATCHDOG_SEC = 900
+MAX_SNAPSHOT_HOURS = 72
 PHASE2 = REPO / "detect_pricing_degradation.py"
+
+# Замеры длительности запросов ClickHouse за текущий запуск (для q_ms в журнале).
+_QMS: list[float] = []
+# Кэш трендов за запуск: (t_from, t_to, provider, metric) -> buckets.
+_TREND_CACHE: dict[tuple[int, int, str, str], list] = {}
 
 # Единственный источник значений по умолчанию. pricing_alert_config.json может
 # переопределять любое из них; _load_config() добавляет отсутствующие ключи.
@@ -94,6 +113,8 @@ CONFIG_DEFAULTS = {
     "single_provider_error_pct": 20.0,
     "single_provider_runtime_sec": 20.0,
     "single_provider_max_n": 1,
+    "watchdog_floor": 100,
+    "registry_refresh_hour": 3,
 }
 
 
@@ -120,6 +141,7 @@ def _state_defaults() -> dict:
         "active_since": "",
         "last_notify": "",
         "alerted_hours": 0,
+        "last_full_hour": "",
         **_single_defaults(),
     }
 
@@ -193,6 +215,9 @@ def _log_event(decision: str, cur: dict, base: dict, det: dict,
         "suppressed": det.get("suppressed", {}),
         "fired": fired,
         "decision": decision,
+        "q_ms": {"n": len(_QMS),
+                 "total": round(sum(_QMS), 1) if _QMS else 0.0,
+                 "max": max(_QMS) if _QMS else 0.0},
     }
     try:
         EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -226,9 +251,11 @@ def _grafana_query(cfg: dict, raw_query: str, t_from: int, t_to: int) -> list[tu
     ctx = ssl.create_default_context()
     last_err = None
     for attempt in range(3):
+        t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=90, context=ctx) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
+            _QMS.append(round((time.monotonic() - t0) * 1000, 1))
             break
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_err = e
@@ -261,23 +288,29 @@ def _rows(frames: list[tuple[str, list]]) -> list[dict]:
     return out
 
 
-def _window(t_from: int, t_to: int, cfg: dict) -> dict:
+def _window_cur(t_from: int, t_to: int, cfg: dict) -> dict:
+    """Текущее окно: 2 запроса по провайдерам + 1 объёмный (только cur).
+
+    Base-окно берётся из файлового кэша (_load_snapshot), а не перезапросом:
+    полный разбор = 3 запроса вместо 6. Интервалы полуоткрытые [from, to),
+    чтобы граничная секунда не учитывалась в двух соседних часах дважды.
+    """
     q_rt = (
         "SELECT provider, count() n, avg(runtime) avg_r, max(runtime) max_r, "
         f"quantile(0.95)(runtime) p95 FROM provider.provider_runtime_logs "
-        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<=toDateTime({t_to}) "
+        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<toDateTime({t_to}) "
         "AND area='price' GROUP BY provider HAVING n>=%d" % MIN_PROVIDER_N
     )
     q_err = (
         "SELECT provider, count() n, countIf(statusCode>=500) e FROM provider.provider_logs "
-        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<=toDateTime({t_to}) "
+        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<toDateTime({t_to}) "
         "AND area='price' GROUP BY provider HAVING n>=%d" % MIN_PROVIDER_N
     )
     q_vol = (
         "SELECT count() n, countIf(totalTime>10) slow, "
         "avg(totalTime) avg_t, quantile(0.99)(totalTime) p99 "
         "FROM provider.provider_logs "
-        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<=toDateTime({t_to}) "
+        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<toDateTime({t_to}) "
         "AND area='price'"
     )
     rt = {r["provider"]: r for r in _rows(_grafana_query(cfg, q_rt, t_from, t_to))}
@@ -285,6 +318,228 @@ def _window(t_from: int, t_to: int, cfg: dict) -> dict:
     vol = _rows(_grafana_query(cfg, q_vol, t_from, t_to))
     vol = vol[0] if vol else {}
     return {"runtime": rt, "errors": err, "volume": vol}
+
+
+# Для обратной совместимости: _window(cur)+_window(base) больше не используется
+# в main (base берётся из кэша), но оставлена для тестов/диагностики.
+def _window(t_from: int, t_to: int, cfg: dict) -> dict:
+    return _window_cur(t_from, t_to, cfg)
+
+
+def _hour_label(ts: int) -> str:
+    """Метка ровного часа: '2026-10-01 05:00' (для дедупа почасового разбора)."""
+    return datetime.fromtimestamp(ts - ts % 3600).strftime("%Y-%m-%d %H:00")
+
+
+def _snap_dir() -> Path:
+    # Рядом с STATE: в тестах STATE подменён на tmp — снапшоты тоже уйдут в tmp.
+    d = STATE.parent / "hourly"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _snapshot_label(ts: int) -> str:
+    return datetime.fromtimestamp(ts - ts % 3600).strftime("%Y%m%d-%H")
+
+
+def _snapshot_path(label: str) -> Path:
+    return _snap_dir() / f"{label}.json"
+
+
+def _save_snapshot(label: str, cur: dict) -> None:
+    try:
+        _snapshot_path(label).write_text(
+            json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+        # Чистим старше MAX_SNAPSHOT_HOURS.
+        cutoff = time.time() - MAX_SNAPSHOT_HOURS * 3600
+        for p in _snap_dir().glob("*.json"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError as e:
+        print(f"{_ts()} не удалось сохранить снапшот {label}: {e}")
+
+
+def _load_snapshot(label: str) -> dict | None:
+    p = _snapshot_path(label)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "runtime" in data and "errors" in data:
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _volume_from_matrix(err: dict) -> dict:
+    """Объём base-окна без запроса: SUM(n) err-матрицы кэша (slow/avg/p99 нет)."""
+    return {"n": sum(int(r.get("n") or 0) for r in err.values()),
+            "slow": 0, "avg_t": 0.0, "p99": 0.0}
+
+
+def _base_for(t_from: int, cfg: dict) -> dict:
+    """Base = тот же час сутки назад: из кэша, при промахе — живой запрос."""
+    label = _snapshot_label(t_from - SHIFT_SEC)
+    snap = _load_snapshot(label)
+    if snap is not None:
+        vol = snap.get("volume") or _volume_from_matrix(snap.get("errors") or {})
+        return {"runtime": snap.get("runtime") or {},
+                "errors": snap.get("errors") or {}, "volume": vol}
+    cur = _window_cur(t_from - SHIFT_SEC, t_from - SHIFT_SEC + WINDOW_SEC, cfg)
+    _save_snapshot(label, cur)
+    return cur
+
+
+def _watchdog_counts(cfg: dict, t_from: int, t_to: int) -> dict:
+    """Лёгкий watchdog: 1 запрос без GROUP BY и квантилей (каждые 15 мин)."""
+    q = (
+        "SELECT count() n, avg(totalTime) avg_t FROM provider.provider_logs "
+        f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<toDateTime({t_to}) "
+        "AND area='price'"
+    )
+    rows = _rows(_grafana_query(cfg, q, t_from, t_to))
+    return rows[0] if rows else {}
+
+
+def _watchdog_fires(cur15: dict, base_vol_n: int, cfg: dict) -> bool:
+    """Обвал за 15 мин vs¼ часовой нормы сутки назад (с защитой от ночного шума).
+
+    Нет данных (n отсутствует) — не стреляем: отсутствие замера ≠ обвал.
+    """
+    if not isinstance(cur15, dict) or cur15.get("n") is None:
+        return False
+    try:
+        n = int(cur15.get("n") or 0)
+    except (TypeError, ValueError):
+        return False
+    expected15 = float(base_vol_n or 0) / 4.0
+    if expected15 < float(cfg.get("watchdog_floor", 100)):
+        return False
+    return n < (1.0 - float(cfg.get("volume_drop", 0.7))) * expected15
+
+
+def _registry_path() -> Path:
+    return STATE.parent / "providers_registry.json"
+
+
+def _load_registry() -> dict:
+    p = _registry_path()
+    reg: dict = {"updated_day": "", "hours_total": 0, "providers": {}}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                reg.update(data)
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not isinstance(reg.get("providers"), dict):
+        reg["providers"] = {}
+    return reg
+
+
+def _save_registry(reg: dict) -> None:
+    try:
+        tmp = _registry_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(reg, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _registry_path())
+    except OSError as e:
+        print(f"{_ts()} не удалось сохранить реестр: {e}")
+
+
+def _registry_core(reg: dict) -> list[str]:
+    """Ядро реестра: присутствие >90% почасовых разборов (стабильный знаменатель)."""
+    total = int(reg.get("hours_total") or 0)
+    if total <= 0:
+        return []
+    return sorted(p for p, v in (reg.get("providers") or {}).items()
+                  if isinstance(v, dict) and v.get("hours_seen", 0) / total >= 0.9)
+
+
+def _update_registry_presence(reg: dict, cur: dict, now_s: str) -> dict:
+    union = set(cur.get("runtime") or {}) | set(cur.get("errors") or {})
+    reg["hours_total"] = int(reg.get("hours_total") or 0) + 1
+    prov = reg.setdefault("providers", {})
+    for p in union:
+        e = prov.setdefault(p, {"first_seen": now_s, "last_seen": now_s,
+                                "hours_seen": 0})
+        e["last_seen"] = now_s
+        e["hours_seen"] = int(e.get("hours_seen") or 0) + 1
+    # Выбытие: не видели 30 суток — вычёркиваем (реестр актуализируется сам).
+    try:
+        cutoff = (datetime.strptime(now_s, "%Y-%m-%d %H:%M:%S")
+                  - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        for p in [k for k, v in prov.items()
+                  if isinstance(v, dict) and v.get("last_seen", "") < cutoff]:
+            del prov[p]
+    except ValueError:
+        pass
+    return reg
+
+
+def _seed_registry_from_csv(reg: dict, now_s: str) -> dict:
+    """Первичный сид ядра из providers_active.csv (если файл доступен)."""
+    csv_path = Path.home() / "providers_active.csv"
+    if not csv_path.exists():
+        return reg
+    try:
+        import csv as _csv
+        rows = None
+        for enc in ("utf-16", "utf-8-sig", "utf-8"):
+            try:
+                with csv_path.open(encoding=enc) as f:
+                    rows = list(_csv.DictReader(f))
+                break
+            except (UnicodeError, UnicodeDecodeError):
+                continue
+        if not rows:
+            return reg
+        prov = reg.setdefault("providers", {})
+        for r in rows:
+            name = (r.get("name") or "").strip()
+            if name and name not in prov:
+                prov[name] = {"first_seen": now_s, "last_seen": now_s,
+                              "hours_seen": 0}
+        print(f"{_ts()} реестр: сид из CSV, всего {len(prov)}")
+    except OSError as e:
+        print(f"{_ts()} реестр: CSV не прочитан: {e}")
+    return reg
+
+
+def _refresh_registry_if_due(reg: dict, cfg: dict, now_s: str) -> dict:
+    """Ночной refresh (по умолчанию 03:00): 2 лёгких GROUP BY за 24ч, без часовой
+    размерности — тяжёлые toStartOfHour-запросы на недели рвут SSL/таймауты."""
+    try:
+        today = now_s[:10]
+        if reg.get("updated_day") == today:
+            return reg
+        if datetime.now().hour != int(cfg.get("registry_refresh_hour", 3)):
+            return reg
+        now = int(time.time())
+        r_from, r_to = now - 86400, now
+        seen: set[str] = set()
+        for table in ("provider.provider_logs", "provider.provider_runtime_logs"):
+            q = (f"SELECT provider FROM {table} "
+                 f"WHERE timestamp>=toDateTime({r_from}) AND timestamp<toDateTime({r_to}) "
+                 "AND area='price' GROUP BY provider")
+            for r in _rows(_grafana_query(cfg, q, r_from, r_to)):
+                seen.add(str(r["provider"]))
+        if not seen:
+            return reg
+        prov = reg.setdefault("providers", {})
+        for p in seen:
+            e = prov.setdefault(p, {"first_seen": now_s, "last_seen": now_s,
+                                    "hours_seen": 0})
+            e["last_seen"] = now_s
+        reg["updated_day"] = today
+        print(f"{_ts()} реестр: refresh, активных за сутки {len(seen)}, "
+              f"всего {len(prov)}")
+    except Exception as e:
+        print(f"{_ts()} реестр: refresh пропущен: {str(e)[:120]}")
+    return reg
 
 
 def _provider_trend(cfg: dict, t_from: int, t_to: int, provider: str, metric: str) -> list:
@@ -300,7 +555,7 @@ def _provider_trend(cfg: dict, t_from: int, t_to: int, provider: str, metric: st
             "SELECT intDiv(toUInt32(timestamp) - %d, 600) b, "
             "count() n, countIf(statusCode>=500) e "
             "FROM provider.provider_logs "
-            f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<=toDateTime({t_to}) "
+            f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<toDateTime({t_to}) "
             f"AND area='price' AND provider='{esc}' "
             "GROUP BY b ORDER BY b" % (t_from)
         )
@@ -308,7 +563,7 @@ def _provider_trend(cfg: dict, t_from: int, t_to: int, provider: str, metric: st
         q = (
             "SELECT intDiv(toUInt32(timestamp) - %d, 600) b, avg(runtime) avg_r "
             "FROM provider.provider_runtime_logs "
-            f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<=toDateTime({t_to}) "
+            f"WHERE timestamp>=toDateTime({t_from}) AND timestamp<toDateTime({t_to}) "
             f"AND area='price' AND provider='{esc}' "
             "GROUP BY b ORDER BY b" % (t_from)
         )
@@ -329,17 +584,28 @@ def _provider_trend(cfg: dict, t_from: int, t_to: int, provider: str, metric: st
 def _attach_trends(cfg: dict, det: dict, t_from: int, t_to: int) -> None:
     """Загружает 10-мин тренды для аномальных провайдеров (для sparkline).
 
-    Точечные запросы, по одному на провайдера; сбои Grafana не ломают
-    инцидент — тренды просто не выводятся.
+    Точечные запросы, по одному на провайдера, не более TREND_MAX_PROVIDERS
+    на метрику; сбои Grafana не ломают инцидент — тренды просто не выводятся.
+    Кэш за запуск: эскалация того же окна запросы не повторяет.
     """
-    for r in det.get("runtime", [])[:MAX_PROVIDERS_IN_MSG]:
+    for r in det.get("runtime", [])[:TREND_MAX_PROVIDERS]:
+        key = (t_from, t_to, r["provider"], "runtime")
+        if key in _TREND_CACHE:
+            r["trend"] = _TREND_CACHE[key]
+            continue
         try:
-            r["trend"] = _provider_trend(cfg, t_from, t_to, r["provider"], "runtime")
+            r["trend"] = _TREND_CACHE[key] = _provider_trend(
+                cfg, t_from, t_to, r["provider"], "runtime")
         except Exception:
             r["trend"] = []
-    for e in det.get("errors", [])[:MAX_PROVIDERS_IN_MSG]:
+    for e in det.get("errors", [])[:TREND_MAX_PROVIDERS]:
+        key = (t_from, t_to, e["provider"], "errors")
+        if key in _TREND_CACHE:
+            e["trend"] = _TREND_CACHE[key]
+            continue
         try:
-            e["trend"] = _provider_trend(cfg, t_from, t_to, e["provider"], "errors")
+            e["trend"] = _TREND_CACHE[key] = _provider_trend(
+                cfg, t_from, t_to, e["provider"], "errors")
         except Exception:
             e["trend"] = []
 
@@ -658,11 +924,14 @@ def _build_recovery_message(cur: dict, base: dict, cfg: dict,
 
 def _build_single_message(det: dict, cfg: dict, t_from: int, t_to: int,
                           providers: list[str], eligible: int,
-                          headline: str | None = None) -> str:
+                          headline: str | None = None,
+                          active_now: int | None = None) -> str:
     """Сообщение тихого яруса: один поставщик деградировал, глобальной деградации нет.
 
     Заголовок намеренно не похож на глобальный «Веб-проценка замедлилась»,
     иначе получатель не отличит локальный сбой от инцидента.
+    eligible — размер ядра реестра (стабильный знаменатель); active_now —
+    активных в текущем часе (честный срез). Без реестра — старый текст.
     """
     if headline is None:
         if len(providers) == 1:
@@ -686,8 +955,13 @@ def _build_single_message(det: dict, cfg: dict, t_from: int, t_to: int,
                      f"p95 {r['p95']} с, ×{r['ratio']})")
 
     lines.append("")
-    lines.append(f"Не глобальная деградация: {len(providers)} из {_fmt_int(eligible)} "
-                 f"поставщиков на грани. Проверьте вручную.")
+    if active_now is None:
+        lines.append(f"Не глобальная деградация: {len(providers)} из {_fmt_int(eligible)} "
+                     f"поставщиков на грани. Проверьте вручную.")
+    else:
+        lines.append(f"Не глобальная деградация: {len(providers)} из {_fmt_int(eligible)} "
+                     f"ядра реестра. Активных в этом часе: {_fmt_int(active_now)}. "
+                     f"Проверьте вручную.")
     lines.append("")
     lines.append(f"График времени: {_grafana_link(t_from, t_to, 25)}")
     lines.append(f"График ошибок:  {_grafana_link(t_from, t_to, 27)}")
@@ -729,7 +1003,7 @@ def _single_hits(det: dict, cfg: dict) -> list[str]:
 
 def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
                    t_from: int, t_to: int, state: dict,
-                   now_s: str) -> tuple[str | None, dict]:
+                   now_s: str, reg: dict | None = None) -> tuple[str | None, dict]:
     """Тихий ярус: сбои ниже порога числа поставщиков (по умолчанию один).
 
     Троттлинг общий на все одиночные сбои: молчим single_provider_every_hours
@@ -774,12 +1048,20 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
         return "single_provider_silent", {}
 
     eligible = max(len(cur.get("errors") or {}), len(cur.get("runtime") or {}))
+    active_now: int | None = None
+    if reg is not None:
+        core = _registry_core(reg)
+        if core:
+            eligible = len(core)
+            active_now = len(set(cur.get("runtime") or {})
+                             | set(cur.get("errors") or {}))
     headline = None
     if state.get("single_active"):
         hours = int(elapsed // 3600) if elapsed is not None else 0
         headline = (f"\U000026a0\ufe0f Отдельный поставщик деградирует уже {hours} ч · "
                     f"{_format_window(t_from, t_to)}")
-    _notify(_build_single_message(det, cfg, t_from, t_to, names, eligible, headline),
+    _notify(_build_single_message(det, cfg, t_from, t_to, names, eligible,
+                                  headline, active_now),
             "pricing-alert: поставщик деградировал")
     print(f"{_ts()} ОДИНОЧНЫЙ СБОЙ: {', '.join(names)}")
     return "single_provider", {
@@ -790,35 +1072,38 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
     }
 
 
-def main() -> int:
-    cfg = _load_config()
-    window = int(cfg["window_seconds"])
-    now = int(time.time())
-    cur_from = now - window
-    cur_to = now
-    base_from = cur_from - SHIFT_SEC
-    base_to = cur_to - SHIFT_SEC
+def _analyze(cur_from: int, cur_to: int, cfg: dict, state: dict,
+             now_s: str, reg: dict, full_label: str | None,
+             snap_label: str | None) -> int:
+    """Полный разбор окна: base из кэша, детект, single/incident/escalation.
 
+    full_label — метка ровного часа для дедупа (None = скользящий разбор,
+    метку не трогаем); snap_label — сохранить cur-снапшот + presence реестра.
+    """
     print(f"{_ts()} окно {_format_window(cur_from, cur_to)} "
-          f"(эталон {_format_dt(datetime.fromtimestamp(base_from))})")
-    cur = _window(cur_from, cur_to, cfg)
-    base = _window(base_from, base_to, cfg)
+          f"(эталон {_format_dt(datetime.fromtimestamp(cur_from - SHIFT_SEC))})")
+    cur = _window_cur(cur_from, cur_to, cfg)
+    base = _base_for(cur_from, cfg)
     det = _detect(cur, base, cfg)
     is_abnormal = bool(det["runtime"] or det["errors"] or det["volume"])
 
-    state = _load_state()
-    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if snap_label is not None:
+        _save_snapshot(snap_label, cur)
+        _save_registry(_update_registry_presence(reg, cur, now_s))
 
     if not is_abnormal:
         single_decision, single_patch = None, {}
         if cfg["single_provider_notify"]:
             single_decision, single_patch = _handle_single(
-                cur, base, det, cfg, cur_from, cur_to, state, now_s)
+                cur, base, det, cfg, cur_from, cur_to, state, now_s, reg)
         if state.get("active"):
             body = _build_recovery_message(cur, base, cfg, cur_from, cur_to)
             _notify(body, "pricing-alert: восстановлено")
-        _save_state({**state, "active": False, "active_since": "", "last_notify": "",
-                     "alerted_hours": 0, **single_patch})
+        patch = {"active": False, "active_since": "", "last_notify": "",
+                 "alerted_hours": 0, **single_patch}
+        if full_label is not None:
+            patch["last_full_hour"] = full_label
+        _save_state({**state, **patch})
         decision = "recovery" if state.get("active") else "normal"
         if single_decision:
             decision = (single_decision if decision == "normal"
@@ -838,8 +1123,11 @@ def main() -> int:
             lines += "\n\nТаймауты проценки на БД (× к норме, таймауты/ч):\n"
             lines += "\n".join(site_lines)
         _notify(lines, "pricing-alert: проценка замедлилась")
-        _save_state({**state, "active": True, "active_since": now_s, "last_notify": now_s,
-                     "alerted_hours": 0})
+        patch = {"active": True, "active_since": now_s, "last_notify": now_s,
+                 "alerted_hours": 0}
+        if full_label is not None:
+            patch["last_full_hour"] = full_label
+        _save_state({**state, **patch})
         _log_event("incident", cur, base, det, cfg, cur_from, cur_to)
         print(f"{_ts()} ИНЦИДЕНТ: {len(det['runtime'])} runtime, "
               f"{len(det['errors'])} errors, volume={bool(det['volume'])}")
@@ -862,6 +1150,66 @@ def main() -> int:
     _log_event("escalation" if escalated else "ongoing",
                cur, base, det, cfg, cur_from, cur_to)
     print(f"{_ts()} продолжается (часов: {hours})")
+    return 0
+
+
+def main() -> int:
+    """Гибридный график (нагрузка на ClickHouse снижена ~5×):
+
+    - открытый инцидент → полный скользящий разбор каждые 15 мин (свежесть
+      эскалации важнее экономии; инциденты редки);
+    - новый завершённый ровный час → полный разбор [H-1ч, H], base из файлового
+      кэша (вчерашний cur), дедуп по метке часа в state;
+    - иначе → watchdog: 1 лёгкий запрос без GROUP BY/квантилей; при обвале —
+      досрочный полный разбор скользящего часа.
+    """
+    _QMS.clear()
+    _TREND_CACHE.clear()
+    cfg = _load_config()
+    now = int(time.time())
+    state = _load_state()
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    reg = _load_registry()
+    if not reg.get("providers"):
+        reg = _seed_registry_from_csv(reg, now_s)
+    reg = _refresh_registry_if_due(reg, cfg, now_s)
+    _save_registry(reg)
+
+    window = int(cfg["window_seconds"])
+    h_to = now - now % 3600
+    label = _hour_label(h_to)
+
+    if state.get("active"):
+        return _analyze(now - window, now, cfg, state, now_s, reg, None, None)
+
+    if state.get("last_full_hour") != label:
+        return _analyze(h_to - window, h_to, cfg, state, now_s, reg,
+                        label, _snapshot_label(h_to))
+
+    w_to, w_from = now, now - WATCHDOG_SEC
+    try:
+        cur15 = _watchdog_counts(cfg, w_from, w_to)
+    except Exception as e:
+        print(f"{_ts()} watchdog: запрос не удался: {str(e)[:120]}")
+        _log_event("watchdog_error", {}, {},
+                   {"runtime": [], "errors": [], "volume": {}, "suppressed": {}},
+                   cfg, w_from, w_to)
+        return 0
+    base_snap = _load_snapshot(_snapshot_label(h_to - SHIFT_SEC))
+    base_n = 0
+    if base_snap is not None:
+        base_n = int((base_snap.get("volume") or {}).get("n") or 0)
+        if not base_n:
+            base_n = _volume_from_matrix(base_snap.get("errors") or {})["n"]
+    if _watchdog_fires(cur15, base_n, cfg):
+        print(f"{_ts()} watchdog: обвал объёма, досрочный разбор "
+              f"{_format_window(now - window, now)}")
+        return _analyze(now - window, now, cfg, state, now_s, reg, None, None)
+    _log_event("watchdog_ok", {"volume": cur15}, {"volume": {"n": base_n}},
+               {"runtime": [], "errors": [], "volume": {}, "suppressed": {}},
+               cfg, w_from, w_to)
+    print(f"{_ts()} норма (watchdog)")
     return 0
 
 
