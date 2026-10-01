@@ -158,7 +158,7 @@ def _log_event(decision: str, cur: dict, base: dict, det: dict,
     fired = [k for k in ("runtime", "errors", "volume") if det.get(k)]
     record = {
         "ts": _ts(),
-        "window": f"{_timepoint(t_from)}-{_timepoint(t_to)}",
+        "window": _format_window(t_from, t_to),
         "t_from": t_from,
         "t_to": t_to,
         "eligible": {
@@ -428,8 +428,49 @@ def _detect(cur: dict, base: dict, cfg: dict) -> dict:
     return res
 
 
+RU_MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня",
+                  "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+def _format_dt(dt: datetime) -> str:
+    """Человеческая дата: '1 октября 05:03 МСК' (год — только если не текущий)."""
+    if dt.year != datetime.now().year:
+        return f"{dt.day} {RU_MONTHS_GEN[dt.month - 1]} {dt.year} {dt:%H:%M} МСК"
+    return f"{dt.day} {RU_MONTHS_GEN[dt.month - 1]} {dt:%H:%M} МСК"
+
+
 def _timepoint(ts: int) -> str:
-    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M МСК")
+    return _format_dt(datetime.fromtimestamp(ts))
+
+
+def _format_window(t_from: int, t_to: int) -> str:
+    """Период одной строкой, дата один раз если день общий.
+
+    Один день:   '1 октября 05:03–06:03 МСК'
+    Разные дни:  '30 сентября 23:00 – 1 октября 00:00 МСК'
+    Год добавляется, если окно не в текущем году.
+    """
+    f = datetime.fromtimestamp(t_from)
+    t = datetime.fromtimestamp(t_to)
+    now_y = datetime.now().year
+    need_year = f.year != now_y or t.year != now_y or f.year != t.year
+
+    def _d(dt: datetime) -> str:
+        if need_year:
+            return f"{dt.day} {RU_MONTHS_GEN[dt.month - 1]} {dt.year} {dt:%H:%M}"
+        return f"{dt.day} {RU_MONTHS_GEN[dt.month - 1]} {dt:%H:%M}"
+
+    if f.date() == t.date():
+        return f"{_d(f)}–{t:%H:%M} МСК"
+    return f"{_d(f)} – {_d(t)} МСК"
+
+
+def _format_since(s: str) -> str:
+    """'2026-09-30 08:00:00' → '30 сентября 08:00 МСК'; при ошибке — как есть."""
+    try:
+        return _format_dt(datetime.strptime(s, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return s
 
 
 def _fmt_int(n) -> str:
@@ -512,7 +553,7 @@ def _build_message(det: dict, cfg: dict, t_from: int, t_to: int,
                    top_timeouts: float = 0.0, headline: str | None = None) -> str:
     if headline is None:
         headline = (f"\U000026a0\ufe0f Веб-проценка замедлилась · "
-                    f"{_timepoint(t_from)}–{_timepoint(t_to)}")
+                    f"{_format_window(t_from, t_to)}")
     lines = [headline]
     summary = []
     if det["runtime"]:
@@ -573,7 +614,7 @@ def _build_recovery_message(cur: dict, base: dict, cfg: dict,
     Период выводится как «с норм. проценкой» — читается как подтверждение,
     что возврат к норме произошёл и метрики в порядке.
     """
-    lines = [f"\U00002705 Веб-проценка восстановлена · {_timepoint(t_from)}–{_timepoint(t_to)}"]
+    lines = [f"\U00002705 Веб-проценка восстановлена · {_format_window(t_from, t_to)}"]
     rows = []
     cv, bv = cur["volume"], base["volume"]
     if cv and bv and bv.get("n"):
@@ -629,7 +670,7 @@ def _build_single_message(det: dict, cfg: dict, t_from: int, t_to: int,
         else:
             subject = "Поставщики деградировали"
         headline = (f"\U000026a0\ufe0f {subject} · "
-                    f"{_timepoint(t_from)}–{_timepoint(t_to)}")
+                    f"{_format_window(t_from, t_to)}")
     lines = [headline]
     sup = det.get("suppressed") or {}
 
@@ -658,7 +699,7 @@ def _build_single_recovery_message(t_from: int, t_to: int,
     names = ", ".join(providers) if providers else "—"
     return "\n".join([
         f"\U00002705 Отдельный поставщик восстановлен · "
-        f"{_timepoint(t_from)}–{_timepoint(t_to)}",
+        f"{_format_window(t_from, t_to)}",
         "",
         f"  • вернулся к норме: {names}",
         "",
@@ -737,7 +778,7 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
     if state.get("single_active"):
         hours = int(elapsed // 3600) if elapsed is not None else 0
         headline = (f"\U000026a0\ufe0f Отдельный поставщик деградирует уже {hours} ч · "
-                    f"{_timepoint(t_from)}–{_timepoint(t_to)}")
+                    f"{_format_window(t_from, t_to)}")
     _notify(_build_single_message(det, cfg, t_from, t_to, names, eligible, headline),
             "pricing-alert: поставщик деградировал")
     print(f"{_ts()} ОДИНОЧНЫЙ СБОЙ: {', '.join(names)}")
@@ -758,8 +799,8 @@ def main() -> int:
     base_from = cur_from - SHIFT_SEC
     base_to = cur_to - SHIFT_SEC
 
-    print(f"{_ts()} окно {_timepoint(cur_from)}–{_timepoint(cur_to)} "
-          f"(эталон {_timepoint(base_from)})")
+    print(f"{_ts()} окно {_format_window(cur_from, cur_to)} "
+          f"(эталон {_format_dt(datetime.fromtimestamp(base_from))})")
     cur = _window(cur_from, cur_to, cfg)
     base = _window(base_from, base_to, cfg)
     det = _detect(cur, base, cfg)
@@ -812,7 +853,7 @@ def main() -> int:
     if hours >= 1 and (datetime.now() - last).total_seconds() >= escalate_every * 3600:
         _attach_trends(cfg, det, cur_from, cur_to)
         headline = (f"\U000026a0\ufe0f Веб-проценка замедлена уже {hours} ч "
-                    f"(с {state['active_since']})")
+                    f"(с {_format_since(state['active_since'])})")
         body = _build_message(det, cfg, cur_from, cur_to,
                               top_timeouts=0.0, headline=headline)
         _notify(body, "pricing-alert: инцидент продолжается")
