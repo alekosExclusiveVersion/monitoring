@@ -61,6 +61,7 @@ DEFAULT_CUR_HOURS = 1
 DEFAULT_BASE_HOURS = 24
 INCREASE_FACTOR = 2.0
 MIN_TIMEOUTS = 10
+MIN_PROVIDER_TIMEOUTS = 3
 MIN_AVG_DELTA = 5.0
 MIN_SESSIONS = 50
 TS_COL = "ses_sse_timestamp"
@@ -95,11 +96,15 @@ def _has_tables(conn, db: str) -> set:
 
 
 def _count_window(conn, db: str, table: str, col: str, ts_from: str, ts_to: str,
-                  extra: tuple = ()) -> int:
+                   extra: tuple = (), provider: str | None = None) -> int:
     where = f"{col}>=%s AND {col}<%s"
     params = (ts_from, ts_to) + extra
     if extra:
         where += " AND (wl_desc LIKE %s OR wl_desc LIKE %s)"
+    if provider is not None:
+        # Привязка таймаутов к конкретному поставщику (wl_provider).
+        where += " AND wl_provider=%s"
+        params = params + (provider,)
     rows = _conn_query(
         conn,
         f"SELECT COUNT(*) n FROM `{db}`.`{table}` WHERE {where}",
@@ -122,9 +127,16 @@ def _avg_window(conn, db: str, table: str, ts_col: str, avg_col: str,
 
 
 def process_server(host: str, cur_from: str, cur_to: str,
-                   base_from: str, base_to: str, cur_hours: float,
-                   base_hours: float):
+                    base_from: str, base_to: str, cur_hours: float,
+                    base_hours: float, provider: str | None = None):
+    """Скан одного MySQL-сервера.
+
+    provider — точная привязка таймаутов к поставщику (wl_provider): тогда
+    sessions/avg_time/providers-метрики пропускаются (у search_external_stat
+    нет колонки провайдера — секунды с привязкой дать нельзя), порог ниже.
+    """
     rows: list[dict] = []
+    min_t = MIN_PROVIDER_TIMEOUTS if provider is not None else MIN_TIMEOUTS
 
     logger.info(f"{host}: подключение")
 
@@ -147,10 +159,10 @@ def process_server(host: str, cur_from: str, cur_to: str,
                 if "web_logs" in has:
                     cur_t = _count_window(
                         conn, db, "web_logs", LOG_COL, cur_from, cur_to,
-                        TIMEOUT_PATTERNS,
+                        TIMEOUT_PATTERNS, provider=provider,
                     )
                     cur_p = 0
-                    if cur_t:
+                    if cur_t and provider is None:
                         rows_p = _conn_query(
                             conn,
                             f"SELECT COUNT(DISTINCT wl_provider) p FROM `{db}`.`web_logs` "
@@ -161,7 +173,7 @@ def process_server(host: str, cur_from: str, cur_to: str,
                         cur_p = int(rows_p[0]["p"] or 0)
                     base_t = _count_window(
                         conn, db, "web_logs", LOG_COL, base_from, base_to,
-                        TIMEOUT_PATTERNS,
+                        TIMEOUT_PATTERNS, provider=provider,
                     ) / base_hours
                     cur_t = cur_t / cur_hours
                 else:
@@ -169,7 +181,11 @@ def process_server(host: str, cur_from: str, cur_to: str,
                     cur_p = 0
                     base_t = 0.0
 
-                if "search_external_stat" in has:
+                if provider is not None:
+                    # Провайдерный режим: site-агрегаты не нужны — пропускаем
+                    # тяжёлые AVG-запросы, дальше только таймауты по wl_provider.
+                    cur_s, cur_a, base_a, n_b = 0.0, float("nan"), float("nan"), 0
+                elif "search_external_stat" in has:
                     n, avg_c = _avg_window(conn, db, "search_external_stat", TS_COL, TIME_COL, cur_from, cur_to)
                     n_b, avg_b = _avg_window(conn, db, "search_external_stat", TS_COL, TIME_COL, base_from, base_to)
                     cur_s = float(n)
@@ -180,13 +196,17 @@ def process_server(host: str, cur_from: str, cur_to: str,
                     cur_a = float("nan")
                     base_a = float("nan")
 
-                if cur_t >= MIN_TIMEOUTS and base_t and cur_t > base_t * INCREASE_FACTOR:
+                if cur_t >= min_t and base_t and cur_t > base_t * INCREASE_FACTOR:
                     rows.append({
                         "server": host, "database": db, "site": site,
                         "metric": "timeouts", "current": round(cur_t, 1),
                         "baseline": round(base_t, 1),
                         "delta": round(cur_t / base_t, 1),
                     })
+                if provider is not None:
+                    # Провайдерный режим — только атрибутированные таймауты;
+                    # site-уровень (sessions/avg_time) к поставщику не привязываем.
+                    continue
                 if cur_p >= MIN_TIMEOUTS and base_t and cur_p > base_t * INCREASE_FACTOR:
                     rows.append({
                         "server": host, "database": db, "site": site,
@@ -243,6 +263,9 @@ def main():
                         help="Только для режима 'последние N часов' без --cur-from (по умолчанию 1)")
     parser.add_argument("--out", default=None,
                         help="Путь к CSV-файлу результата (по умолчанию pricing_degradation.csv)")
+    parser.add_argument("--provider", default=None,
+                        help="Только таймауты этого поставщика (wl_provider) по сайтам; "
+                             "site-метрики пропускаются")
     args = parser.parse_args()
 
     now = datetime.now()
@@ -268,7 +291,7 @@ def main():
             host,
             cur_from.strftime(FMT), cur_to.strftime(FMT),
             base_from.strftime(FMT), base_to.strftime(FMT),
-            cur_hours, base_hours,
+            cur_hours, base_hours, provider=args.provider,
         )
 
     results = worker_pool.run(servers, _process)

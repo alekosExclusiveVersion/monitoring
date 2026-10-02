@@ -75,6 +75,12 @@ class PricingAlertTestCase(unittest.TestCase):
         notify.start()
         self.addCleanup(notify.stop)
 
+        # MySQL-скан по умолчанию замокирован: прямой вызов _handle_single
+        # не должен порождать живой subprocess.
+        phase2 = mock.patch.object(pa, "_runs_phase2", return_value=([], 0.0))
+        phase2.start()
+        self.addCleanup(phase2.stop)
+
     def run_main_hourly(self, cur, base, cfg, watchdog_n=1000):
         """Без сброса метки: второй прогон в том же часе идёт в watchdog."""
         with (
@@ -362,6 +368,75 @@ class SingleMessage(PricingAlertTestCase):
         self.assertIn("akparts", body)
         self.assertIn("viewPanel=25", body)
         self.assertIn("viewPanel=27", body)
+
+    def test_sites_section_none_means_no_section(self):
+        cfg = full_config()
+        det = pa._detect(
+            make_window(errors={"akparts": make_error(770)}),
+            make_window(errors={"akparts": make_error(244)}),
+            full_config(),
+        )
+        body = pa._build_single_message(det, cfg, TF, TT, ["akparts"], 180)
+
+        self.assertNotIn("Влияние на поиск", body)
+
+    def test_sites_section_with_lines(self):
+        cfg = full_config()
+        det = pa._detect(
+            make_window(errors={"akparts": make_error(770)}),
+            make_window(errors={"akparts": make_error(244)}),
+            full_config(),
+        )
+        body = pa._build_single_message(
+            det, cfg, TF, TT, ["akparts"], 180,
+            site_sections=["Влияние на поиск (таймауты akparts по сайтам):",
+                           "    autodoc.ru (db1) ×6 к норме (132/ч)"])
+
+        self.assertIn("Влияние на поиск (таймауты akparts по сайтам):", body)
+        self.assertIn("autodoc.ru (db1)", body)
+
+    def test_sites_section_empty_means_no_traces(self):
+        cfg = full_config()
+        det = pa._detect(
+            make_window(errors={"akparts": make_error(770)}),
+            make_window(errors={"akparts": make_error(244)}),
+            full_config(),
+        )
+        body = pa._build_single_message(det, cfg, TF, TT, ["akparts"], 180,
+                                        site_sections=[])
+
+        self.assertIn("следов akparts на сайтах не найдено", body)
+
+    def test_handle_single_runs_phase2_for_provider(self):
+        cfg = full_config()
+        cur = make_window(errors={"akparts": make_error(770)})
+        base = make_window(errors={"akparts": make_error(244)})
+        det = pa._detect(cur, base, cfg)
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with mock.patch.object(pa, "_runs_phase2",
+                               return_value=([], 0.0)) as p2:
+            decision, _ = pa._handle_single(cur, base, det, cfg, TF, TT,
+                                           pa._load_state(), now_s)
+
+        self.assertEqual(decision, "single_provider")
+        p2.assert_called_once()
+        self.assertEqual(p2.call_args.kwargs.get("provider")
+                         or p2.call_args[0][2], "akparts")
+        self.assertIn("следов akparts на сайтах не найдено", self.sent[0][1])
+
+    def test_handle_single_sites_disabled_means_no_section(self):
+        cfg = full_config(single_provider_sites=False)
+        cur = make_window(errors={"akparts": make_error(770)})
+        base = make_window(errors={"akparts": make_error(244)})
+        det = pa._detect(cur, base, cfg)
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with mock.patch.object(pa, "_runs_phase2") as p2:
+            decision, _ = pa._handle_single(cur, base, det, cfg, TF, TT,
+                                           pa._load_state(), now_s)
+
+        self.assertEqual(decision, "single_provider")
+        p2.assert_not_called()
+        self.assertNotIn("Влияние на поиск", self.sent[0][1])
 
 
 class SingleEventLog(PricingAlertTestCase):

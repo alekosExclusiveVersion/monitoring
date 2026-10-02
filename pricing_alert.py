@@ -45,7 +45,9 @@ single_provider_silent, single_provider_recovery.
 часов («продолжается N ч»), при восстановлении — «всё нормально».
 
 При инциденте (один раз) дополнительно запускается detect_pricing_degradation.py
-(MySQL-скан) ради списка сайтов с «Превышено время ожидания».
+(MySQL-скан) ради списка сайтов с «Превышено время ожидания». Тихий ярус
+при уведомлении запускает тот же скан с --provider: секция «Влияние на поиск»
+показывает сайты, где таймауты именно этого поставщика (wl_provider).
 
 Секреты: Grafana-логин/пароль, Telegram-токен/чат — через secret_get()
 (macOS Keychain / Windows Credential Manager / SEC_* env).
@@ -113,6 +115,7 @@ CONFIG_DEFAULTS = {
     "single_provider_error_pct": 20.0,
     "single_provider_runtime_sec": 20.0,
     "single_provider_max_n": 1,
+    "single_provider_sites": True,
     "watchdog_floor": 100,
     "registry_refresh_hour": 3,
 }
@@ -784,14 +787,20 @@ def _write_fallback(text: str) -> None:
         f.write(f"{_ts()} pricing-alert: {text}\n")
 
 
-def _runs_phase2(cur_from: int, cur_to: int) -> tuple[list[str], float]:
+def _runs_phase2(cur_from: int, cur_to: int,
+                 provider: str | None = None) -> tuple[list[str], float]:
+    """MySQL-скан сайтов. provider — только таймауты этого поставщика
+    (wl_provider) с доменом сайта; без provider — общий формат по БД."""
     try:
         out = Path(tempfile.gettempdir()) / f"pricing_degradation_{int(time.time())}.csv"
+        cmd = [sys.executable or "python3", str(PHASE2),
+               "--cur-from", datetime.fromtimestamp(cur_from).strftime("%Y-%m-%d %H:%M:%S"),
+               "--cur-to", datetime.fromtimestamp(cur_to).strftime("%Y-%m-%d %H:%M:%S"),
+               "--out", str(out)]
+        if provider is not None:
+            cmd += ["--provider", provider]
         subprocess.run(
-            [sys.executable or "python3", str(PHASE2),
-             "--cur-from", datetime.fromtimestamp(cur_from).strftime("%Y-%m-%d %H:%M:%S"),
-             "--cur-to", datetime.fromtimestamp(cur_to).strftime("%Y-%m-%d %H:%M:%S"),
-             "--out", str(out)],
+            cmd,
             capture_output=True, text=True, timeout=600,
             cwd=str(REPO),
         )
@@ -803,8 +812,14 @@ def _runs_phase2(cur_from: int, cur_to: int) -> tuple[list[str], float]:
             reader = _csv.DictReader(f)
             timeouts = [r for r in reader if r["METRIC"] == "timeouts"]
             for r in sorted(timeouts, key=lambda r: -float(r["DELTA"]))[:MAX_SITES_IN_MSG]:
-                lines.append(f"    {r['DATABASE']} ×{float(r['DELTA']):.0f} к норме "
-                             f"({float(r['CURRENT']):.0f}/ч)")
+                if provider is not None:
+                    site = (r.get("SITE") or "").strip() or r["DATABASE"]
+                    lines.append(f"    {site} ({r['DATABASE']}) "
+                                 f"×{float(r['DELTA']):.0f} к норме "
+                                 f"({float(r['CURRENT']):.0f}/ч)")
+                else:
+                    lines.append(f"    {r['DATABASE']} ×{float(r['DELTA']):.0f} к норме "
+                                 f"({float(r['CURRENT']):.0f}/ч)")
             if timeouts:
                 top_to = float(max(timeouts, key=lambda r: float(r["DELTA"]))["DELTA"])
             else:
@@ -813,6 +828,18 @@ def _runs_phase2(cur_from: int, cur_to: int) -> tuple[list[str], float]:
         lines = [f"    (MySQL-скан не отработал: {str(e)[:100]})"]
         top_to = 0.0
     return lines, top_to
+
+
+def _single_site_sections(names: list[str], cfg: dict,
+                          t_from: int, t_to: int) -> list[str]:
+    """Секции 'Влияние на поиск' по первым двум поставщикам (cap ради MySQL)."""
+    out: list[str] = []
+    for p in names[:2]:
+        lines, _ = _runs_phase2(t_from, t_to, provider=p)
+        if lines:
+            out.append(f"Влияние на поиск (таймауты {p} по сайтам):")
+            out.extend(lines)
+    return out
 
 
 def _build_message(det: dict, cfg: dict, t_from: int, t_to: int,
@@ -925,13 +952,15 @@ def _build_recovery_message(cur: dict, base: dict, cfg: dict,
 def _build_single_message(det: dict, cfg: dict, t_from: int, t_to: int,
                           providers: list[str], eligible: int,
                           headline: str | None = None,
-                          active_now: int | None = None) -> str:
+                          active_now: int | None = None,
+                          site_sections: list[str] | None = None) -> str:
     """Сообщение тихого яруса: один поставщик деградировал, глобальной деградации нет.
 
     Заголовок намеренно не похож на глобальный «Веб-проценка замедлилась»,
     иначе получатель не отличит локальный сбой от инцидента.
-    eligible — размер ядра реестра (стабильный знаменатель); active_now —
+    eligible — число поставщиков под наблюдением (стабильный знаменатель); active_now —
     активных в текущем часе (честный срез). Без реестра — старый текст.
+    site_sections — строки «Влияние на поиск» (None = без секции).
     """
     if headline is None:
         if len(providers) == 1:
@@ -957,11 +986,18 @@ def _build_single_message(det: dict, cfg: dict, t_from: int, t_to: int,
     lines.append("")
     if active_now is None:
         lines.append(f"Не глобальная деградация: {len(providers)} из {_fmt_int(eligible)} "
-                     f"поставщиков на грани. Проверьте вручную.")
+                     f"поставщиков на грани.")
     else:
         lines.append(f"Не глобальная деградация: {len(providers)} из {_fmt_int(eligible)} "
-                     f"ядра реестра. Активных в этом часе: {_fmt_int(active_now)}. "
-                     f"Проверьте вручную.")
+                     f"поставщиков под наблюдением. "
+                     f"Активных поставщиков в этом часе: {_fmt_int(active_now)}.")
+    if site_sections is not None:
+        lines.append("")
+        if site_sections:
+            lines.extend(site_sections)
+        else:
+            names = ", ".join(providers) if providers else "—"
+            lines.append(f"Влияние на поиск: следов {names} на сайтах не найдено.")
     lines.append("")
     lines.append(f"График времени: {_grafana_link(t_from, t_to, 25)}")
     lines.append(f"График ошибок:  {_grafana_link(t_from, t_to, 27)}")
@@ -1060,8 +1096,10 @@ def _handle_single(cur: dict, base: dict, det: dict, cfg: dict,
         hours = int(elapsed // 3600) if elapsed is not None else 0
         headline = (f"\U000026a0\ufe0f Отдельный поставщик деградирует уже {hours} ч · "
                     f"{_format_window(t_from, t_to)}")
+    site_sections = (_single_site_sections(names, cfg, t_from, t_to)
+                     if cfg.get("single_provider_sites", True) else None)
     _notify(_build_single_message(det, cfg, t_from, t_to, names, eligible,
-                                  headline, active_now),
+                                  headline, active_now, site_sections),
             "pricing-alert: поставщик деградировал")
     print(f"{_ts()} ОДИНОЧНЫЙ СБОЙ: {', '.join(names)}")
     return "single_provider", {
