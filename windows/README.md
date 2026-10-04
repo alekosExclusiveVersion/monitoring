@@ -22,6 +22,7 @@
   | `tradesoft-pricing-alert` | каждые 15 мин | `pricing_alert.py` |
   | `tradesoft-tg-support-reader` | ежечасно | `tg_support_alert.py` |
   | `tradesoft-db-clean` | ежедневно 21:00 | `db_clean.py --commit --notify` |
+  | `tradesoft-db-clean-retry` | каждые 30 мин, пока стоит маркер | `Invoke-DbCleanRetry.ps1` → `db_clean.py --commit --notify` |
 
 - **БД-доступ** — данные приложения PSA лежат в
   `%APPDATA%\Parallels SQL Admin\` (servers.json + servers.key). Ключ — Fernet
@@ -247,6 +248,8 @@
   если демоны ещё живы на обеих машинах.
 - **pricing-alert** посылает алерты только если в момент запуска машина онлайн;
   обратную засылку проспанных окон не делает (как и на macOS).
-- **db-clean на Windows**: автоматического retry нет; ошибки и пустые результаты
-  остаются в `%USERPROFILE%\Work\logs\db-clean.log`, уведомления приходят только
-  после фактического удаления БД.
+- **db-clean на Windows**: retry есть (`tradesoft-db-clean-retry` каждые
+  30 мин через `Invoke-DbCleanRetry.ps1`, срабатывает по маркеру
+  `db-clean.retry`); `FAIL` (включая `FAIL precheck`: DNS/ping) уведомляется
+  всегда, `DB_CLEAN_NOTIFY_ON_DELETE=1` ограничивает только `ok`/`dryrun`;
+  повторные недоступности в retry тихие (`DB_CLEAN_RETRY=1`).

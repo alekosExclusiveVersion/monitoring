@@ -74,18 +74,22 @@ New-Task "tradesoft-pricing-alert" "`"$MonitoringRepo\pricing_alert.py`"" $trigA
 New-Task "tradesoft-tg-support-reader" "`"$MonitoringRepo\tg_support_alert.py`"" $trigHourly
 New-Task "tradesoft-db-clean" "`"$DbCleanRepo\db_clean.py`" --commit --notify" $trigDaily
 
-$retryTaskName = "tradesoft-db-clean-retry"
-$retryTask = Get-ScheduledTask -TaskName $retryTaskName -ErrorAction SilentlyContinue
-if ($null -ne $retryTask) {
-    Stop-ScheduledTask -TaskName $retryTaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $retryTaskName -Confirm:$false
-    Write-Host "task removed: $retryTaskName"
-}
-foreach ($path in @("$PSScriptRoot\run-db-clean-retry.pyw", "$LogDir\run-db-clean-retry.cmd")) {
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Force
-    }
-}
+# --- retry db-clean: каждые 30 мин, пока стоит маркер ------------------------
+# Маркер DB_CLEAN_RETRY_MARKER ставит db_clean.py при недоступности aisql /
+# ошибках удаления (включая FAIL precheck: DNS/ping) и снимает при успехе.
+# Обёртка Invoke-DbCleanRetry.ps1 без маркера тихо выходит; повторные
+# недоступности идут в тихом режиме (DB_CLEAN_RETRY=1) без дубля db-clean.fail.
+$trigRetry = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 30)
+$retryAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\Invoke-DbCleanRetry.ps1`"" `
+    -WorkingDirectory $MonitoringRepo
+$retrySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+    -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+    -RunOnlyIfNetworkAvailable
+Register-ScheduledTask -TaskName "tradesoft-db-clean-retry" `
+    -Action $retryAction -Trigger $trigRetry -Settings $retrySettings -Force | Out-Null
+Write-Host "task created: tradesoft-db-clean-retry"
 
 Write-Host "Готово. Проверка: Get-ScheduledTask -TaskName 'tradesoft-*'"
 Write-Host "Логи: $LogDir"
